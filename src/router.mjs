@@ -1,4 +1,4 @@
-// codex-router core: tier decision, ladder walk, bucket checks, hard timeouts.
+// job-router core: tier decision, ladder walk, bucket checks, hard timeouts.
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -9,7 +9,7 @@ export const expand = (p) => (p && p.startsWith('~') ? path.join(os.homedir(), p
 const DEFAULTS = {
   codexBin: 'codex',
   sessionsDir: '~/.codex/sessions',
-  logFile: '~/.local/state/codex-router/log.jsonl',
+  logFile: '~/.local/state/job-router/log.jsonl',
   runTimeoutMs: 15 * 60 * 1000,
   probeTimeoutMs: 60 * 1000,
   killGraceMs: 5000,
@@ -22,8 +22,13 @@ const DEFAULTS = {
   rejectPatterns: ['model is not supported', 'unsupported model', 'model_not_found', 'does not exist or you do not have access', 'not supported when using codex', 'invalid model'],
 };
 
-export function defaultConfigPath(env = process.env) {
-  return env.CODEX_ROUTER_CONFIG || expand('~/.config/codex-router/config.json');
+// New path ~/.config/job-router/config.json; falls back to legacy ~/.config/codex-router/config.json if the new one is missing.
+export function defaultConfigPath(env = process.env, home = os.homedir()) {
+  const fromEnv = env.JOB_ROUTER_CONFIG || env.CODEX_ROUTER_CONFIG;
+  if (fromEnv) return fromEnv;
+  const primary = path.join(home, '.config', 'job-router', 'config.json');
+  const legacy = path.join(home, '.config', 'codex-router', 'config.json');
+  return !fs.existsSync(primary) && fs.existsSync(legacy) ? legacy : primary;
 }
 
 export function loadConfig(file) {

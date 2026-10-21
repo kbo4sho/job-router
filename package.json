@@ -1,3 +1,3 @@
-{ "name": "codex-router", "version": "0.1.0", "private": true, "type": "module",
-  "bin": { "codex-router": "bin/codex-router.mjs" },
+{ "name": "job-router", "version": "0.1.0", "private": true, "type": "module",
+  "bin": { "job-router": "bin/job-router.mjs" },
   "scripts": { "test": "node --test test/router.test.mjs" }, "engines": { "node": ">=20" } }

@@ -1,7 +1,7 @@
 {
   "codexBin": "codex",
   "sessionsDir": "~/.codex/sessions",
-  "logFile": "~/.local/state/codex-router/log.jsonl",
+  "logFile": "~/.local/state/job-router/log.jsonl",
   "runTimeoutMs": 900000,
   "probeTimeoutMs": 60000,
   "fallbackOnTimeout": true,

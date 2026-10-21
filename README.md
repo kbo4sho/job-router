@@ -1,4 +1,4 @@
-# codex-router
+# job-router
 
 Tiny, dependency-free wrapper around `codex exec` that picks a model by **job type → tier → ladder**,
 falls down the ladder on usage limits / model rejection / exhausted rate-limit buckets / timeouts,
@@ -7,7 +7,7 @@ logs every decision as JSONL, and **fails closed** (nonzero exit, never hangs).
 No model names live in code: the ladder comes from a config file.
 
 ## Config
-Default path `~/.config/codex-router/config.json` (override: `CODEX_ROUTER_CONFIG` or `--config`).
+Default path `~/.config/job-router/config.json`, falling back to legacy `~/.config/codex-router/config.json` if missing (override: `JOB_ROUTER_CONFIG`, legacy `CODEX_ROUTER_CONFIG`, or `--config`).
 See `router.config.example.json`. Keys: `jobTypes` (job → tier), `tiers` (ordered ladder of
 `{model, bucket?}`), `deniedModels`, `runTimeoutMs` (default 15 min), `probeTimeoutMs` (60 s),
 `fallbackOnTimeout`, `limitPatterns`, `rejectPatterns`, `sessionsDir`, `logFile`.
@@ -18,16 +18,18 @@ See `router.config.example.json`. Keys: `jobTypes` (job → tier), `tiers` (orde
 
 ## Usage
 ```sh
-codex-router which --job brand-illustration           # print chosen model, no spend
-codex-router run --job ship -- "fix the failing test"  # codex exec -m <model> ...
-codex-router run --job ship --probe -- --json "..."    # cheap preflight per model first
+job-router which --job brand-illustration           # print chosen model, no spend
+job-router run --job ship -- "fix the failing test"  # codex exec -m <model> ...
+job-router run --job ship --probe -- --json "..."    # cheap preflight per model first
 ```
 Exit codes: 0 ok · 2 config/usage · 3 ladder exhausted · 124 timeout (fallbackOnTimeout=false) · otherwise codex's exit code (non-limit errors don't burn the ladder).
 
 Every codex child gets stdin closed (`</dev/null` equivalent), runs in its own process group, and the
 whole group is SIGTERM'd then SIGKILL'd at the timeout (no `timeout(1)` needed on macOS).
 
-Log: `~/.local/state/codex-router/log.jsonl` (`attempt`, `fallback` with `reason`, `success`, `error`, `exhausted`).
+Log: `~/.local/state/job-router/log.jsonl` (`attempt`, `fallback` with `reason`, `success`, `error`, `exhausted`).
 
 ## Tests
 `npm test` (node:test, fake codex binary in `test/fake-codex.mjs`).
+
+`bin/codex-router.mjs` is a back-compat shim that forwards to `bin/job-router.mjs`.

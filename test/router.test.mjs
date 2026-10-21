@@ -104,3 +104,16 @@ test('deniedModels are filtered from ladder', () => {
   const { cfg } = setup({}, { tiers: { normal: ['BANNED', 'M3'] } });
   assert.equal(which(cfg).model, 'M3');
 });
+
+test('config path: prefers job-router, falls back to legacy codex-router, env overrides', async () => {
+  const { defaultConfigPath } = await import('../src/router.mjs');
+  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'crhome-'));
+  const nu = path.join(home, '.config', 'job-router', 'config.json');
+  const old = path.join(home, '.config', 'codex-router', 'config.json');
+  assert.equal(defaultConfigPath({}, home), nu); // neither exists -> new path
+  fs.mkdirSync(path.dirname(old), { recursive: true }); fs.writeFileSync(old, '{}');
+  assert.equal(defaultConfigPath({}, home), old); // only legacy
+  fs.mkdirSync(path.dirname(nu), { recursive: true }); fs.writeFileSync(nu, '{}');
+  assert.equal(defaultConfigPath({}, home), nu); // both -> new wins
+  assert.equal(defaultConfigPath({ JOB_ROUTER_CONFIG: '/x' }, home), '/x');
+});
