@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { route, which, RouterError } from '../src/router.mjs';
+import { route, which, RouterError, classify, DEFAULTS } from '../src/router.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const fake = path.join(here, 'fake-codex.mjs');
@@ -116,4 +116,27 @@ test('config path: prefers job-router, falls back to legacy codex-router, env ov
   fs.mkdirSync(path.dirname(nu), { recursive: true }); fs.writeFileSync(nu, '{}');
   assert.equal(defaultConfigPath({}, home), nu); // both -> new wins
   assert.equal(defaultConfigPath({ JOB_ROUTER_CONFIG: '/x' }, home), '/x');
+});
+
+test('exit 0 with limit/reject text in output is success, not fallback', async () => {
+  const { cfg, calls, log } = setup({ M1: 'okmention' });
+  const r = await route(cfg, { jobType: 'default', codexArgs: ['x'] });
+  assert.equal(r.model, 'M1');
+  assert.deepEqual(calls(), ['M1']);
+  assert.ok(!log().some((e) => e.event === 'fallback'));
+});
+
+test('classify ignores exit 0 and matches only on failure', () => {
+  const cfg = { limitPatterns: ["you've hit your usage limit"], rejectPatterns: ['is not supported'] };
+  assert.equal(classify(cfg, "You've hit your usage limit", 0), null);
+  assert.equal(classify(cfg, "You've hit your usage limit", 1), 'usage_limit');
+  assert.equal(classify(cfg, 'model is not supported', 1), 'model_rejected');
+  assert.equal(classify(cfg, 'boom', 1), null);
+});
+
+test('default limitPatterns are narrow (no bare 429 / usage limit)', () => {
+  assert.ok(!DEFAULTS.limitPatterns.includes('429'));
+  assert.ok(!DEFAULTS.limitPatterns.includes('usage limit'));
+  assert.equal(classify(DEFAULTS, 'HTTP 429 while fetching docs; usage limit field', 1), null);
+  assert.equal(classify(DEFAULTS, 'Rate limit reached for requests', 1), 'usage_limit');
 });

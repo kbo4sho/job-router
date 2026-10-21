@@ -9,5 +9,6 @@ const b = plan[model] || 'ok';
 if (b === 'ok') { console.log(`fake ok from ${model}`); process.exit(0); }
 if (b === 'limit') { console.error("ERROR: You've hit your usage limit. Try again later."); process.exit(1); }
 if (b === 'reject') { console.error(`ERROR: The '${model}' model is not supported when using Codex with a ChatGPT account.`); process.exit(1); }
+if (b === 'okmention') { console.log(`fake ok from ${model}; docs mention "You've hit your usage limit", 429 and 'model is not supported'`); process.exit(0); }
 if (b === 'error') { console.error('boom'); process.exit(7); }
 if (b === 'hang') { if (plan.pidFile) fs.writeFileSync(plan.pidFile, String(process.pid)); setInterval(() => {}, 1000); }
