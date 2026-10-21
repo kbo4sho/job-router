@@ -1,0 +1,21 @@
+{
+  "codexBin": "codex",
+  "sessionsDir": "~/.codex/sessions",
+  "logFile": "~/.local/state/codex-router/log.jsonl",
+  "runTimeoutMs": 900000,
+  "probeTimeoutMs": 60000,
+  "fallbackOnTimeout": true,
+  "jobTypes": { "default": "normal", "ship": "normal", "brand-illustration": "high-craft" },
+  "tiers": {
+    "normal": [
+      { "model": "<PRIMARY_MODEL>", "bucket": "premium" },
+      { "model": "<SECONDARY_MODEL>", "bucket": "codex" },
+      { "model": "<CHEAP_MODEL>" }
+    ],
+    "high-craft": [
+      { "model": "<BEST_MODEL>", "bucket": "premium" },
+      { "model": "<PRIMARY_MODEL>" }
+    ]
+  },
+  "deniedModels": ["<MODEL_YOU_NEVER_WANT>"]
+}
