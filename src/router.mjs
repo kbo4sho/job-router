@@ -19,6 +19,10 @@ const DEFAULTS = {
   tiers: {},
   deniedModels: [],
   limitPatterns: ["you've hit your usage limit", 'usage limit', 'rate limit reached', 'quota exceeded', '429'],
+  ollamaUrl: 'http://127.0.0.1:11434',
+  localTimeoutMs: 5 * 60 * 1000,
+  // Job types that must never run on a local model (art / brand illustration).
+  noLocalJobTypes: ['brand-illustration', 'art'],
   rejectPatterns: ['model is not supported', 'unsupported model', 'model_not_found', 'does not exist or you do not have access', 'not supported when using codex', 'invalid model'],
 };
 
@@ -51,9 +55,34 @@ export function resolveTier(cfg, jobType) {
   const denied = new Set((cfg.deniedModels || []).map((m) => m.toLowerCase()));
   const ladder = cfg.tiers[tier]
     .map((e) => (typeof e === 'string' ? { model: e } : e))
-    .filter((e) => e.model && !denied.has(e.model.toLowerCase()));
+    .filter((e) => e.model && !denied.has(e.model.toLowerCase()))
+    .filter((e) => !(isLocal(e) && noLocal(cfg, jt, tier)));
+  const bad = ladder.find((e) => e.provider && !['codex', 'ollama'].includes(e.provider));
+  if (bad) throw new RouterError(`tier "${tier}": unknown provider "${bad.provider}" for ${bad.model}`, 2);
   if (!ladder.length) throw new RouterError(`tier "${tier}" ladder is empty (after deniedModels)`, 2);
   return { jobType: jt, tier, ladder };
+}
+
+export const isLocal = (e) => e.provider === 'ollama';
+const noLocal = (cfg, jt, tier) => (cfg.noLocalJobTypes ?? DEFAULTS.noLocalJobTypes).some((x) => x === jt || x === tier);
+
+// Local model call via Ollama's HTTP API. Prompt = the last codex arg (the task text).
+export async function runLocal(cfg, model, prompt) {
+  const ctl = new AbortController();
+  const t = setTimeout(() => ctl.abort(), cfg.localTimeoutMs ?? DEFAULTS.localTimeoutMs);
+  try {
+    const res = await fetch(`${(cfg.ollamaUrl ?? DEFAULTS.ollamaUrl).replace(/\/$/, '')}/api/generate`, {
+      method: 'POST', headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ model, prompt, stream: false }), signal: ctl.signal,
+    });
+    const text = await res.text();
+    if (!res.ok) return { ok: false, reason: 'local_failed', detail: `http ${res.status}` };
+    let out; try { out = JSON.parse(text).response; } catch { out = undefined; }
+    if (typeof out !== 'string' || !out.trim()) return { ok: false, reason: 'local_failed', detail: 'empty response' };
+    return { ok: true, out, err: '', code: 0 };
+  } catch (e) {
+    return { ok: false, reason: ctl.signal.aborted ? 'local_timeout' : 'local_unavailable', detail: String(e.message || e) };
+  } finally { clearTimeout(t); }
 }
 
 // Latest rate_limits snapshot per limit_id from newest session jsonl files.
@@ -142,7 +171,7 @@ export function which(cfg, jobType) {
   for (const e of ladder) {
     const why = e.bucket ? bucketExhausted(buckets[e.bucket]) : null;
     if (why) { skipped.push({ model: e.model, bucket: e.bucket, reason: why }); continue; }
-    return { jobType: jt, tier, model: e.model, skipped };
+    return { jobType: jt, tier, model: e.model, provider: e.provider || 'codex', skipped };
   }
   return { jobType: jt, tier, model: null, skipped };
 }
@@ -152,6 +181,16 @@ export async function route(cfg, { jobType, codexArgs = [], probe = false, log =
   const attempts = [];
   const fall = (a) => { attempts.push(a); log({ event: 'fallback', jobType: jt, tier, ...a }); };
   for (const e of ladder) {
+    if (isLocal(e)) {
+      const last = codexArgs.at(-1);
+      const prompt = last && !last.startsWith('-') ? last : null; // codex exec's trailing positional prompt
+      if (!prompt) { fall({ model: e.model, reason: 'local_no_prompt' }); continue; }
+      log({ event: 'attempt', jobType: jt, tier, model: e.model, provider: 'ollama' });
+      const r = await runLocal(cfg, e.model, prompt);
+      if (r.ok) { log({ event: 'success', jobType: jt, tier, model: e.model, provider: 'ollama' }); return { model: e.model, tier, attempts, ...r }; }
+      fall({ model: e.model, reason: r.reason, detail: r.detail });
+      continue;
+    }
     const bucketWhy = e.bucket ? bucketExhausted(readBuckets(cfg)[e.bucket]) : null;
     if (bucketWhy) { fall({ model: e.model, reason: 'bucket_exhausted', detail: `${e.bucket}: ${bucketWhy}` }); continue; }
     if (probe) {

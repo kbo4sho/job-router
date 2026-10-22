@@ -33,3 +33,19 @@ Log: `~/.local/state/job-router/log.jsonl` (`attempt`, `fallback` with `reason`,
 `npm test` (node:test, fake codex binary in `test/fake-codex.mjs`).
 
 `bin/codex-router.mjs` is a back-compat shim that forwards to `bin/job-router.mjs`.
+
+## Local-first tier (Ollama)
+
+Ladder entries with `"provider": "ollama"` are called through Ollama's HTTP API
+(`ollamaUrl`, default `http://127.0.0.1:11434`) instead of `codex exec`. The prompt is
+the trailing positional argument after `--`. If the local call fails, times out
+(`localTimeoutMs`), or Ollama is down, the router logs the fallback and moves on
+to the next rung (typically a Codex model). Job types or tiers listed in
+`noLocalJobTypes` (default `brand-illustration`, `art`) never use local rungs,
+even if the config puts one there. See `router.config.local-first.example.json`:
+classify / draft / summarize / volume loops go local first; build and judgment
+stay on Codex.
+
+Local rungs return plain text only (no tool use or file edits), so only route
+job types whose output is text (classification, drafts, summaries) to them.
+Unknown `provider` values are a config error (exit 2).
