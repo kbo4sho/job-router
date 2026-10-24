@@ -1,0 +1,39 @@
+{
+  "codexBin": "codex",
+  "sessionsDir": "~/.codex/sessions",
+  "logFile": "~/.local/state/job-router/log.jsonl",
+  "runTimeoutMs": 900000,
+  "probeTimeoutMs": 60000,
+  "fallbackOnTimeout": true,
+  "ollamaUrl": "http://127.0.0.1:11434",
+  "localTimeoutMs": 300000,
+  "noLocalJobTypes": ["brand-illustration", "art"],
+  "jobTypes": {
+    "default": "normal",
+    "ship": "normal",
+    "build": "normal",
+    "judgment": "normal",
+    "brand-illustration": "high-craft",
+    "art": "high-craft",
+    "classify": "local-first",
+    "draft": "local-first",
+    "summarize": "local-first",
+    "theme-classification": "local-first",
+    "pack-summary": "local-first"
+  },
+  "tiers": {
+    "normal": [
+      { "model": "<CODEX_MODEL>", "bucket": "codex" }
+    ],
+    "high-craft": [
+      { "model": "<CODEX_MODEL>", "bucket": "codex" }
+    ],
+    "local-first": [
+      { "model": "<LOCAL_MODEL_PRIMARY>", "provider": "ollama" },
+      { "model": "<LOCAL_MODEL_SECONDARY>", "provider": "ollama" },
+      { "model": "<CODEX_MODEL>", "bucket": "codex" }
+    ]
+  },
+  "deniedModels": ["<MODEL_YOU_NEVER_WANT>"],
+  "limitPatterns": ["you've hit your usage limit"]
+}

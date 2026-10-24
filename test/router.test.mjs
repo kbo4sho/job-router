@@ -118,6 +118,106 @@ test('config path: prefers job-router, falls back to legacy codex-router, env ov
   assert.equal(defaultConfigPath({ JOB_ROUTER_CONFIG: '/x' }, home), '/x');
 });
 
+// ---- local-first (ollama) ----
+import http from 'node:http';
+function fakeOllama(behaviour) {
+  const seen = [];
+  const srv = http.createServer((req, res) => {
+    let b = ''; req.on('data', (d) => { b += d; }); req.on('end', () => {
+      const body = JSON.parse(b); seen.push(body.model);
+      const mode = behaviour[body.model] || 'ok';
+      if (mode === 'ok') { res.end(JSON.stringify({ response: `local ok from ${body.model}: ${body.prompt}` })); }
+      else if (mode === 'empty') { res.end(JSON.stringify({ response: '' })); }
+      else if (mode === 'hang') { /* never answer */ }
+      else { res.statusCode = 500; res.end('{"error":"x"}'); }
+    });
+  });
+  return new Promise((r) => srv.listen(0, '127.0.0.1', () => r({ url: `http://127.0.0.1:${srv.address().port}`, seen, close: () => { srv.closeAllConnections(); srv.close(); } })));
+}
+const localTiers = (url) => ({
+  ollamaUrl: url, localTimeoutMs: 500,
+  jobTypes: { default: 'normal', classify: 'local-first', 'brand-illustration': 'high-craft' },
+  tiers: {
+    normal: [{ model: 'M1' }],
+    'local-first': [{ model: 'L1', provider: 'ollama' }, { model: 'L2', provider: 'ollama' }, { model: 'M1' }],
+    'high-craft': [{ model: 'L1', provider: 'ollama' }, { model: 'H1' }],
+  },
+});
+
+test('local-first: classify runs on local model, codex untouched', async () => {
+  const o = await fakeOllama({});
+  try {
+    const { cfg, calls } = setup({}, localTiers(o.url));
+    const r = await route(cfg, { jobType: 'classify', codexArgs: ['--skip-git-repo-check', 'sort these'] });
+    assert.equal(r.model, 'L1'); assert.match(r.out, /local ok from L1: sort these/);
+    assert.deepEqual(calls(), []); assert.deepEqual(o.seen, ['L1']);
+    assert.equal(which(cfg, 'classify').provider, 'ollama');
+  } finally { o.close(); }
+});
+
+test('local-first: local failures/empty fall through to codex', async () => {
+  const o = await fakeOllama({ L1: 'error', L2: 'empty' });
+  try {
+    const { cfg, calls, log } = setup({}, localTiers(o.url));
+    const r = await route(cfg, { jobType: 'classify', codexArgs: ['p'] });
+    assert.equal(r.model, 'M1'); assert.deepEqual(calls(), ['M1']);
+    assert.ok(log().some((e) => e.model === 'L1' && e.reason === 'local_failed'));
+  } finally { o.close(); }
+});
+
+test('local-first: hung local model times out then falls back', async () => {
+  const o = await fakeOllama({ L1: 'hang', L2: 'hang' });
+  try {
+    const { cfg, log } = setup({}, localTiers(o.url));
+    assert.equal((await route(cfg, { jobType: 'classify', codexArgs: ['p'] })).model, 'M1');
+    assert.ok(log().some((e) => e.reason === 'local_timeout'));
+  } finally { o.close(); }
+});
+
+test('local-first: ollama down falls back', async () => {
+  const { cfg, log } = setup({}, localTiers('http://127.0.0.1:1'));
+  assert.equal((await route(cfg, { jobType: 'classify', codexArgs: ['p'] })).model, 'M1');
+  assert.ok(log().some((e) => e.reason === 'local_unavailable'));
+});
+
+test('local-first: no trailing prompt skips local rungs', async () => {
+  const o = await fakeOllama({});
+  try {
+    const { cfg } = setup({}, localTiers(o.url));
+    assert.equal((await route(cfg, { jobType: 'classify', codexArgs: ['--json'] })).model, 'M1');
+    assert.deepEqual(o.seen, []);
+  } finally { o.close(); }
+});
+
+test('brand-illustration never uses a local rung even if configured', async () => {
+  const o = await fakeOllama({});
+  try {
+    const { cfg, calls } = setup({}, localTiers(o.url));
+    assert.equal(which(cfg, 'brand-illustration').model, 'H1');
+    assert.equal((await route(cfg, { jobType: 'brand-illustration', codexArgs: ['draw'] })).model, 'H1');
+    assert.deepEqual(o.seen, []); assert.deepEqual(calls(), ['H1']);
+  } finally { o.close(); }
+});
+
+test('denied model is dropped from local-first ladder too', () => {
+  const { cfg } = setup({}, { ...localTiers('http://x'), deniedModels: ['L1'] });
+  assert.equal(which(cfg, 'classify').model, 'L2');
+});
+
+test('local-first example config parses and keeps art off local', async () => {
+  const { loadConfig } = await import('../src/router.mjs');
+  const ex = loadConfig(path.join(here, '..', 'router.config.local-first.example.json'));
+  for (const jt of ['classify', 'draft', 'summarize', 'theme-classification', 'pack-summary'])
+    assert.equal(which({ ...ex, sessionsDir: '/nonexistent' }, jt).provider, 'ollama');
+  for (const jt of ['ship', 'build', 'judgment', 'brand-illustration', 'art'])
+    assert.equal(which({ ...ex, sessionsDir: '/nonexistent' }, jt).provider, 'codex');
+});
+
+test('unknown provider is a config error, not a silent codex call', () => {
+  const { cfg } = setup({}, { jobTypes: { default: 'x' }, tiers: { x: [{ model: 'L', provider: 'lmstudio' }] } });
+  assert.throws(() => which(cfg), (e) => e.exitCode === 2 && /unknown provider/.test(e.message));
+});
+
 test('exit 0 with limit/reject text in output is success, not fallback', async () => {
   const { cfg, calls, log } = setup({ M1: 'okmention' });
   const r = await route(cfg, { jobType: 'default', codexArgs: ['x'] });
