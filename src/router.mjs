@@ -6,7 +6,7 @@ import path from 'node:path';
 
 export const expand = (p) => (p && p.startsWith('~') ? path.join(os.homedir(), p.slice(1)) : p);
 
-const DEFAULTS = {
+export const DEFAULTS = {
   codexBin: 'codex',
   sessionsDir: '~/.codex/sessions',
   logFile: '~/.local/state/job-router/log.jsonl',
@@ -18,7 +18,7 @@ const DEFAULTS = {
   jobTypes: { default: 'normal' },
   tiers: {},
   deniedModels: [],
-  limitPatterns: ["you've hit your usage limit", 'usage limit', 'rate limit reached', 'quota exceeded', '429'],
+  limitPatterns: ["you've hit your usage limit", 'rate limit reached', 'quota exceeded'],
   ollamaUrl: 'http://127.0.0.1:11434',
   localTimeoutMs: 5 * 60 * 1000,
   // Job types that must never run on a local model (art / brand illustration).
@@ -124,7 +124,10 @@ export function bucketExhausted(rl) {
   return null;
 }
 
-export function classify(cfg, output) {
+// Only failed runs are classified: a successful run (exit 0) may legitimately
+// mention limits or models in its output (e.g. code it wrote or read).
+export function classify(cfg, output, code) {
+  if (code === 0) return null;
   const t = output.toLowerCase();
   if (cfg.limitPatterns.some((p) => t.includes(p.toLowerCase()))) return 'usage_limit';
   if (cfg.rejectPatterns.some((p) => t.includes(p.toLowerCase()))) return 'model_rejected';
@@ -195,7 +198,7 @@ export async function route(cfg, { jobType, codexArgs = [], probe = false, log =
     if (bucketWhy) { fall({ model: e.model, reason: 'bucket_exhausted', detail: `${e.bucket}: ${bucketWhy}` }); continue; }
     if (probe) {
       const p = await runWithTimeout(expand(cfg.codexBin), ['exec', '--skip-git-repo-check', '-m', e.model, 'Reply with OK.'], cfg.probeTimeoutMs, cfg.killGraceMs);
-      const why = p.timedOut ? 'probe_timeout' : classify(cfg, p.out + p.err) || (p.code !== 0 ? 'probe_failed' : null);
+      const why = p.timedOut ? 'probe_timeout' : classify(cfg, p.out + p.err, p.code) || (p.code !== 0 ? 'probe_failed' : null);
       if (why) { fall({ model: e.model, reason: why, exit: p.code }); continue; }
     }
     log({ event: 'attempt', jobType: jt, tier, model: e.model });
@@ -205,7 +208,7 @@ export async function route(cfg, { jobType, codexArgs = [], probe = false, log =
       if (cfg.fallbackOnTimeout) continue;
       throw new RouterError(`codex timed out after ${cfg.runTimeoutMs}ms on ${e.model}`, 124, attempts);
     }
-    const why = classify(cfg, r.out + r.err);
+    const why = classify(cfg, r.out + r.err, r.code);
     if (r.code === 0 && !why) { log({ event: 'success', jobType: jt, tier, model: e.model }); return { model: e.model, tier, attempts, ...r }; }
     if (why) { fall({ model: e.model, reason: why, exit: r.code }); continue; }
     log({ event: 'error', jobType: jt, tier, model: e.model, exit: r.code });
