@@ -437,3 +437,11 @@ test('legacy run --json foo (no --) forwards --json foo to codex exactly as main
   assert.deepEqual(JSON.parse(r.stdout.trim().split('\n').pop()), ['exec', '-m', 'M1', '--max-wait', 'x', 'foo']);
   assert.deepEqual(events(), []);
 });
+
+test('broken gate config + critical: unknown --class still exits 2, no bypass', () => {
+  const { cli, events } = setup({ gate: '{not json' });
+  const r = cli(['run', '--class', 'ocrr', '--prio', 'critical', '--', 'true']);
+  assert.equal(r.status, 2); assert.match(r.stderr, /unknown class "ocrr"/);
+  assert.equal(cli(['run', '--class', 'ocr', '--prio', 'bogus', '--', 'true']).status, 2);
+  assert.ok(!events().some((e) => e.event === 'gate_bypass'));
+});
