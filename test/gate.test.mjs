@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { LOCK_LOST, flockAcquire, logEvent, acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, isStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
+import { procStart, LOCK_LOST, flockAcquire, logEvent, acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, isStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bin = path.join(here, '..', 'bin', 'job-router.mjs');
@@ -536,4 +536,24 @@ test('weight_clamped: timed-out run logs nothing; poolUnits override with defaul
     (await p.acq('build')).release();
     assert.ok(!p.events().some((e) => e.event === 'weight_clamped'), `poolUnits ${poolUnits}`);
   }
+});
+
+test('pid start time: mismatch on a live pid is stale; no start time or ps failure keeps kill-only', async () => {
+  const me = procStart(process.pid);
+  assert.ok(me && /\d{4}$/.test(me), `ps lstart: ${me}`);
+  const bogus = 'Mon Jan  1 00:00:00 1990';
+  assert.equal(isStale({ pid: process.pid, pidStart: me }), false);
+  assert.equal(isStale({ pid: process.pid, pidStart: bogus }), true);           // reused pid
+  assert.equal(isStale({ pid: process.pid }), false);                            // legacy lease
+  assert.equal(isStale({ pid: spawnSync('true').pid, childPid: process.pid, childStart: bogus }), true);
+  const prev = process.env.JOB_ROUTER_PS;
+  process.env.JOB_ROUTER_PS = '/nonexistent/ps';
+  try {
+    assert.equal(procStart(process.pid), null);
+    assert.equal(isStale({ pid: process.pid, pidStart: bogus }), false);         // ps failure: kill-only
+  } finally { if (prev === undefined) delete process.env.JOB_ROUTER_PS; else process.env.JOB_ROUTER_PS = prev; }
+  const { acq, env } = setup();
+  const l = await acq('codex');
+  assert.equal(readLeases(env.JOB_ROUTER_STATE_DIR)[0].pidStart, me);            // recorded on acquire
+  l.release();
 });

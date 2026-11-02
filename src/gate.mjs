@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
-import { spawn } from 'node:child_process';
+import { spawn, spawnSync } from 'node:child_process';
 import { expand } from './router.mjs';
 
 export const EX_TEMPFAIL = 75;
@@ -254,7 +254,23 @@ export function readLeases(stateDir) {
   return out;
 }
 
-const pidsDead = (l) => !alive(l.pid) && !(l.childPid > 0 && alive(l.childPid));
+// Process start time via ps (pid-reuse guard). null if ps fails or prints nothing.
+export function procStart(pid, ps = process.env.JOB_ROUTER_PS || 'ps') {
+  try {
+    const r = spawnSync(ps, ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 });
+    const out = r.status === 0 ? r.stdout.trim().replace(/\s+/g, ' ') : '';
+    return out || null;
+  } catch { return null; }
+}
+// Alive = kill(pid,0) ok AND (no recorded start, or ps unavailable, or start time matches).
+// A ps failure never makes a live lease stale.
+export function aliveAt(pid, start) {
+  if (!alive(pid)) return false;
+  if (!start) return true;
+  const now = procStart(pid);
+  return now === null || now === start;
+}
+const pidsDead = (l) => !aliveAt(l.pid, l.pidStart) && !(l.childPid > 0 && aliveAt(l.childPid, l.childStart));
 export function isStale(l) {
   return l.corrupt || !(l.pid > 0) || pidsDead(l);
   // A live pid is never reaped by the boot-time heuristic (NTP steps); pre-boot leases die via dead pids.
@@ -303,6 +319,7 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
   const c = cfg.classes[cls];
   if (!c) throw new GateError(`unknown class "${cls}" (known: ${Object.keys(cfg.classes).join(', ')})`);
   const id = `${cls}.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+  const myStart = procStart(process.pid) || undefined;
   const leaseFile = path.join(stateDir, 'leases', `${id}.json`);
   const waitFile = path.join(stateDir, 'waiters', `${id}.json`);
   const wait = maxWaitMs ?? cfg.queueTimeoutMs;
@@ -316,7 +333,7 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
         if (leases === LOCK_LOST) return LOCK_LOST;
         const why = decide(cfg, leases, { cls, prio, load1: s.load1, ncpu: s.ncpu });
         if (!why) {
-          if (!commitLease(owns, leaseFile, { id, pid: process.pid, class: cls, weight: c.weight, prio, startedAt: Date.now(), cmd })) return LOCK_LOST;
+          if (!commitLease(owns, leaseFile, { id, pid: process.pid, pidStart: myStart, class: cls, weight: c.weight, prio, startedAt: Date.now(), cmd })) return LOCK_LOST;
           const used = leases.reduce((a, l) => a + l.weight, 0) + c.weight;
           logEvent(stateDir, { event: 'acquire', class: cls, prio, leaseId: id, pid: process.pid, waitMs: Date.now() - t0, used, pool: cfg.poolUnits, load1: s.load1, ncpu: s.ncpu });
           for (const w of (cfg.clamped || []).filter((x) => x.class === cls)) logEvent(stateDir, { event: 'weight_clamped', leaseId: id, ...w });
@@ -346,7 +363,7 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
   process.once('exit', () => release());
   const setChildPid = (childPid) => {
     if (released) return; // never resurrect a released lease
-    try { const rec = JSON.parse(fs.readFileSync(leaseFile, 'utf8')); rec.childPid = childPid; writeAtomic(leaseFile, JSON.stringify(rec)); } catch {}
+    try { const rec = JSON.parse(fs.readFileSync(leaseFile, 'utf8')); rec.childPid = childPid; rec.childStart = procStart(childPid) || undefined; writeAtomic(leaseFile, JSON.stringify(rec)); } catch {}
   };
   return { id, inherited: false, release, setChildPid, env: { ...(c.env || {}), JOB_ROUTER_LEASE: id } };
 }
