@@ -2,7 +2,7 @@
 import { spawn } from 'node:child_process';
 import os from 'node:os';
 import { loadConfig, defaultConfigPath, which, route, RouterError } from '../src/router.mjs';
-import { loadGateConfig, defaultGateConfigPath, acquire, status, stateDirOf, logEvent, GateError } from '../src/gate.mjs';
+import { loadGateConfig, defaultGateConfigPath, acquire, status, stateDirOf, logEvent, GateError, CLASSES } from '../src/gate.mjs';
 
 const USAGE = `usage:
   job-router which [--job TYPE] [--config FILE]          print chosen model (no spend)
@@ -47,6 +47,8 @@ function gateOrBypass(cls) {
   try { return loadGateConfig(opts.gateConfig); }
   catch (e) {
     if (!critical) throw e;
+    // Validate the class against the built-in list before bypassing, so a typo still exits 2.
+    if (!CLASSES.includes(cls)) throw new GateError(`unknown class "${cls}" (known: ${CLASSES.join(', ')}); gate config also broken: ${e.message}`, 2);
     logEvent(stateDirOf(null), { event: 'gate_bypass', class: cls, prio: opts.prio, reason: e.message, pid: process.pid });
     console.error(`job-router: gate_bypass (critical): ${e.message}`);
     return null;

@@ -438,6 +438,14 @@ test('legacy run --json foo (no --) forwards --json foo to codex exactly as main
   assert.deepEqual(events(), []);
 });
 
+test('broken gate config + critical: unknown --class still exits 2, no bypass', () => {
+  const { cli, events } = setup({ gate: '{not json' });
+  const r = cli(['run', '--class', 'ocrr', '--prio', 'critical', '--', 'true']);
+  assert.equal(r.status, 2); assert.match(r.stderr, /unknown class "ocrr"/);
+  assert.equal(cli(['run', '--class', 'ocr', '--prio', 'bogus', '--', 'true']).status, 2);
+  assert.ok(!events().some((e) => e.event === 'gate_bypass'));
+});
+
 test('events.jsonl rotates by size, keeping one old file', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jrg-rot-'));
   const prev = process.env.JOB_ROUTER_EVENTS_MAX_BYTES;
