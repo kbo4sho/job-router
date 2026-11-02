@@ -6,7 +6,7 @@ import { loadGateConfig, defaultGateConfigPath, acquire, status, stateDirOf, log
 
 const USAGE = `usage:
   job-router which [--job TYPE] [--config FILE]          print chosen model (no spend)
-  job-router run   [--job TYPE] [--probe] [--config FILE] [--prio P] -- <codex exec args...>
+  job-router run   [--job TYPE] [--probe] [--config FILE] [--prio normal|critical] -- <codex exec args...>  (gated as codex only with --prio)
   job-router run   --class ocr|pdf|build|codex|imagegen|ollama [--prio critical] [--max-wait MS] -- <cmd args...>
   job-router status [--json]
   common: --gate-config FILE (default ~/.config/job-router/gate.json, env JOB_ROUTER_GATE_CONFIG)
@@ -23,7 +23,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--config') opts.config = argv[++i];
   else if (a === '--gate-config') opts.gateConfig = argv[++i];
   else if (a === '--class') opts.cls = argv[++i];
-  else if (a === '--prio') opts.prio = argv[++i];
+  else if (a === '--prio') { opts.prio = argv[++i]; opts.prioGiven = true; }
   else if (a === '--max-wait') {
     const raw = argv[++i], v = Number(raw);
     if (raw === undefined || raw === '' || !Number.isFinite(v) || v < 0) { console.error(`job-router: FAIL: --max-wait must be a non-negative number of ms (got "${raw}")`); process.exit(2); }
@@ -94,6 +94,13 @@ try {
   } else {
     const cfg = loadConfig(opts.config);
     if (!opts.rest.length) throw new RouterError('run needs codex exec args after --', 2);
+    if (!opts.prioGiven) {
+      // Legacy path (no --class/--prio): ungated, exactly as before; gate.json is never read.
+      const r = await route(cfg, { jobType: opts.job, codexArgs: opts.rest, probe: opts.probe });
+      for (const a of r.attempts) console.error(`job-router: fell back from ${a.model} (${a.reason})`);
+      console.error(`job-router: used ${r.model} (tier ${r.tier})`);
+      process.stdout.write(r.out); process.stderr.write(r.err);
+    } else {
     const lease = await gated('codex', ['codex', ...opts.rest]);
     Object.assign(process.env, lease.env); // nested job-router calls inherit the lease
     let childPid = null;
@@ -109,6 +116,7 @@ try {
       console.error(`job-router: used ${r.model} (tier ${r.tier})`);
       process.stdout.write(r.out); process.stderr.write(r.err);
     } finally { lease.release(); }
+    }
   }
 } catch (e) {
   if (e.result) { process.stdout.write(e.result.out); process.stderr.write(e.result.err); }

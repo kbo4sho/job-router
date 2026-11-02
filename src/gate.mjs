@@ -101,13 +101,13 @@ export function writeAtomic(file, data) {
 const readOwner = (dir) => { try { return fs.readFileSync(path.join(dir, 'owner'), 'utf8'); } catch { return null; } };
 const inoOf = (dir) => { try { return fs.statSync(dir).ino; } catch { return null; } };
 
-// Stale = predates boot, or owner pid dead. Only when the owner file is missing (creation window) fall back to age.
+// Stale = owner pid dead; if the owner is unreadable, predates boot or older than staleLockMs. Only when the owner file is missing (creation window) fall back to age.
 // A live but paused holder is never stale.
 export function lockIsStale(dir, staleLockMs, boot = bootTimeMs()) {
-  try { if (fs.statSync(dir).mtimeMs < boot) return true; } catch { return false; } // predates boot
   const owner = readOwner(dir);
-  if (owner) { const pid = parseInt(owner, 10); return pid > 0 ? !alive(pid) : true; }
-  try { return Date.now() - fs.statSync(dir).mtimeMs > staleLockMs; } catch { return false; }
+  if (owner) { const pid = parseInt(owner, 10); return pid > 0 ? !alive(pid) : true; } // live owner never stale
+  // Owner unreadable: stale if it predates boot or is past the creation window.
+  try { const m = fs.statSync(dir).mtimeMs; return m < boot || Date.now() - m > staleLockMs; } catch { return false; }
 }
 
 // Remove a lock only if it is exactly the one identified by (inode, owner nonce).
@@ -181,8 +181,10 @@ export function readLeases(stateDir) {
   return out;
 }
 
-export function isStale(l, boot = bootTimeMs()) {
-  return l.corrupt || !(l.pid > 0) || (!alive(l.pid) && !(l.childPid > 0 && alive(l.childPid))) || (l.startedAt && l.startedAt < boot - 60000);
+const pidsDead = (l) => !alive(l.pid) && !(l.childPid > 0 && alive(l.childPid));
+export function isStale(l, boot = bootTimeMs()) { // eslint-disable-line no-unused-vars
+  return l.corrupt || !(l.pid > 0) || pidsDead(l);
+  // A live pid is never reaped by the boot-time heuristic (NTP steps); pre-boot leases die via dead pids.
 }
 
 function reap(stateDir, owns = () => true) {
@@ -205,7 +207,7 @@ export function decide(cfg, leases, { cls, prio, load1, ncpu }) {
     if (grp.includes(cls) && leases.some((l) => grp.includes(l.class))) return `exclusive with ${grp.join('/')}`;
   }
   const limit = critical ? cfg.poolUnits : cfg.poolUnits - (cfg.reserveCritical || 0);
-  if (used + c.weight > Math.max(limit, critical ? 1 : 0)) return `pool ${used}+${c.weight}>${limit}`;
+  if (used + c.weight > limit) return `pool ${used}+${c.weight}>${limit}`;
   if (!critical && (c.heavy ?? HEAVY.has(cls)) && load1 / ncpu >= cfg.maxLoadPerCore) return `load ${(load1 / ncpu).toFixed(2)}/core >= ${cfg.maxLoadPerCore}`;
   return null;
 }

@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
+import { acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, isStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bin = path.join(here, '..', 'bin', 'job-router.mjs');
@@ -129,13 +129,13 @@ test('ocr child gets OMP_THREAD_LIMIT=1, stdio passes, exit code propagates', ()
   assert.equal(r.status, 5); assert.equal(r.stdout.trim(), '1 true');
 });
 
-test('run --job acquires a codex lease through the gate', () => {
+test('run --job --prio acquires a codex lease through the gate', () => {
   const { dir, cli, events } = setup();
   const fake = path.join(dir, 'codex.mjs');
   fs.writeFileSync(fake, '#!/usr/bin/env node\nconsole.log("fake codex lease=" + process.env.JOB_ROUTER_LEASE);\n', { mode: 0o755 });
   const cfgFile = path.join(dir, 'router.json');
   fs.writeFileSync(cfgFile, JSON.stringify({ codexBin: fake, sessionsDir: path.join(dir, 'nosessions'), logFile: path.join(dir, 'log.jsonl'), tiers: { normal: ['M1'] } }));
-  const r = cli(['run', '--config', cfgFile, '--', 'hi']);
+  const r = cli(['run', '--config', cfgFile, '--prio', 'normal', '--', 'hi']);
   assert.equal(r.status, 0, r.stderr);
   assert.match(r.stdout, /fake codex lease=codex\./);
   const ev = events();
@@ -250,7 +250,7 @@ test('run --job: signal kills codex child group, releases lease, child pid recor
   fs.writeFileSync(fake, `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(()=>{},1000);\n`.replace('require', "(await import('node:module')).createRequire(import.meta.url)"), { mode: 0o755 });
   const cfgFile = path.join(dir, 'router.json');
   fs.writeFileSync(cfgFile, JSON.stringify({ codexBin: fake, sessionsDir: path.join(dir, 'ns'), logFile: path.join(dir, 'log.jsonl'), tiers: { normal: ['M1'] } }));
-  const p = spawn(process.execPath, [bin, 'run', '--config', cfgFile, '--', 'hi'], { env, stdio: 'ignore' });
+  const p = spawn(process.execPath, [bin, 'run', '--config', cfgFile, '--prio', 'normal', '--', 'hi'], { env, stdio: 'ignore' });
   const t0 = Date.now();
   while (!fs.existsSync(pidFile) && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 25));
   const cpid = Number(fs.readFileSync(pidFile, 'utf8'));
@@ -259,8 +259,9 @@ test('run --job: signal kills codex child group, releases lease, child pid recor
   const exited = new Promise((r) => p.on('exit', (code) => r(code)));
   p.kill('SIGTERM');
   assert.equal(await exited, 143);
-  await new Promise((r) => setTimeout(r, 100));
-  assert.throws(() => process.kill(cpid, 0));
+  const gone = (pid) => { try { process.kill(pid, 0); return false; } catch { return true; } };
+  for (const t1 = Date.now(); !gone(cpid) && Date.now() - t1 < 3000;) await new Promise((r) => setTimeout(r, 25));
+  assert.ok(gone(cpid), 'codex child should be gone'); // polled: Brick can be slow to reap under load
   assert.deepEqual(readLeases(env.JOB_ROUTER_STATE_DIR), []);
   assert.ok(events().some((e) => e.event === 'release' && e.signal === 'SIGTERM'));
 });
@@ -373,13 +374,40 @@ test('--prio accepts only normal or critical', () => {
   assert.equal(cli(['run', '--class', 'codex', '--prio', 'normal', '--', 'true']).status, 0);
 });
 
-test('lock that predates boot is stale even with a live owner (injected boot time)', () => {
+test('pre-boot lock: live owner NOT stale, dead or missing owner stale (injected boot time)', () => {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jrg-boot-'));
   const lock = path.join(dir, 'lock.d'); fs.mkdirSync(lock);
   fs.writeFileSync(path.join(lock, 'owner'), `${process.pid}.n`);
-  const mt = fs.statSync(lock).mtimeMs;
-  assert.equal(lockIsStale(lock, 10000, mt - 1000), false);
-  assert.equal(lockIsStale(lock, 10000, mt + 1000), true);
+  assert.equal(lockIsStale(lock, 1e9, fs.statSync(lock).mtimeMs + 1000), false);
+  fs.writeFileSync(path.join(lock, 'owner'), `${spawnSync('true').pid}.n`);
+  assert.equal(lockIsStale(lock, 1e9, fs.statSync(lock).mtimeMs + 1000), true);
+  fs.unlinkSync(path.join(lock, 'owner'));
+  assert.equal(lockIsStale(lock, 1e9, fs.statSync(lock).mtimeMs + 1000), true);
+  assert.equal(lockIsStale(lock, 1e9, fs.statSync(lock).mtimeMs - 1000), false);
+});
+
+test('pre-boot lease: live pid NOT stale, dead pid stale (injected boot time)', () => {
+  const boot = Date.now(), old = boot - 3600e3;
+  assert.equal(isStale({ pid: process.pid, startedAt: old }, boot), false);
+  assert.equal(isStale({ pid: spawnSync('true').pid, childPid: process.pid, startedAt: old }, boot), false);
+  assert.equal(isStale({ pid: spawnSync('true').pid, startedAt: old }, boot), true);
+});
+
+test('legacy run --job (no --class/--prio) is ungated: broken gate.json and full pool do not matter', async () => {
+  const { dir, env, cli, events } = setup({ gate: '{broken' });
+  const fake = path.join(dir, 'codex.mjs');
+  fs.writeFileSync(fake, '#!/usr/bin/env node\nconsole.log("legacy ok lease=" + (process.env.JOB_ROUTER_LEASE || "none"));\n', { mode: 0o755 });
+  const cfgFile = path.join(dir, 'router.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ codexBin: fake, sessionsDir: path.join(dir, 'ns'), logFile: path.join(dir, 'log.jsonl'), tiers: { normal: ['M1'] } }));
+  // fill the codex class with live leases held by this process
+  const ld = path.join(env.JOB_ROUTER_STATE_DIR, 'leases'); fs.mkdirSync(ld, { recursive: true });
+  for (let k = 0; k < 12; k++) fs.writeFileSync(path.join(ld, `codex.${k}.json`), JSON.stringify({ id: `codex.${k}`, pid: process.pid, class: 'codex', weight: 1, startedAt: Date.now() }));
+  for (const args of [['run', '--config', cfgFile, '--', 'hi'], ['run', '--job', 'normal', '--config', cfgFile, '--', 'hi']]) {
+    const r = cli(args);
+    assert.equal(r.status, 0, r.stderr);
+    assert.match(r.stdout, /legacy ok lease=none/);
+  }
+  assert.deepEqual(events(), []);
 });
 
 test('stuck live-owner lock: --max-wait 300 exits 75 in about 300 ms', () => {
