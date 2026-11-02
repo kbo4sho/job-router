@@ -182,7 +182,7 @@ export function readLeases(stateDir) {
 }
 
 const pidsDead = (l) => !alive(l.pid) && !(l.childPid > 0 && alive(l.childPid));
-export function isStale(l, boot = bootTimeMs()) { // eslint-disable-line no-unused-vars
+export function isStale(l) {
   return l.corrupt || !(l.pid > 0) || pidsDead(l);
   // A live pid is never reaped by the boot-time heuristic (NTP steps); pre-boot leases die via dead pids.
 }
@@ -273,15 +273,13 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
   const setChildPid = (childPid) => {
     if (released) return; // never resurrect a released lease
     try { const rec = JSON.parse(fs.readFileSync(leaseFile, 'utf8')); rec.childPid = childPid; writeAtomic(leaseFile, JSON.stringify(rec)); } catch {}
-    if (released) try { fs.unlinkSync(leaseFile); } catch {}
   };
   return { id, inherited: false, release, setChildPid, env: { ...(c.env || {}), JOB_ROUTER_LEASE: id } };
 }
 
 export function status(cfg, env = process.env) {
   const stateDir = stateDirOf(cfg, env);
-  const boot = bootTimeMs();
-  const leases = readLeases(stateDir).filter((l) => !isStale(l, boot));
+  const leases = readLeases(stateDir).filter((l) => !isStale(l));
   let waiters = [];
   try {
     waiters = fs.readdirSync(path.join(stateDir, 'waiters')).map((n) => {

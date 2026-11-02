@@ -16,11 +16,18 @@ const argv = process.argv.slice(2);
 const cmd = argv.shift();
 const opts = { job: undefined, config: defaultConfigPath(), gateConfig: defaultGateConfigPath(), probe: false,
   cls: undefined, prio: 'normal', maxWait: undefined, json: false, rest: [] };
+// Gate flags are parsed only for `status` or when --class/--prio appears before `--`.
+// Otherwise parsing is exactly main's: unknown args end parsing and pass through to codex.
+const dd = argv.indexOf('--');
+const pre = dd < 0 ? argv : argv.slice(0, dd);
+const gateMode = cmd === 'status' || pre.includes('--class') || pre.includes('--prio');
 for (let i = 0; i < argv.length; i++) {
   const a = argv[i];
   if (a === '--') { opts.rest = argv.slice(i + 1); break; }
   else if (a === '--job') opts.job = argv[++i];
   else if (a === '--config') opts.config = argv[++i];
+  else if (a === '--probe') opts.probe = true;
+  else if (!gateMode) { opts.rest = argv.slice(i); break; }
   else if (a === '--gate-config') opts.gateConfig = argv[++i];
   else if (a === '--class') opts.cls = argv[++i];
   else if (a === '--prio') { opts.prio = argv[++i]; opts.prioGiven = true; }
@@ -30,7 +37,6 @@ for (let i = 0; i < argv.length; i++) {
     opts.maxWait = v;
   }
   else if (a === '--json') opts.json = true;
-  else if (a === '--probe') opts.probe = true;
   else { opts.rest = argv.slice(i); break; }
 }
 if (!['normal', 'critical'].includes(opts.prio)) { console.error(`job-router: FAIL: --prio must be normal or critical (got "${opts.prio}")`); process.exit(2); }

@@ -386,11 +386,11 @@ test('pre-boot lock: live owner NOT stale, dead or missing owner stale (injected
   assert.equal(lockIsStale(lock, 1e9, fs.statSync(lock).mtimeMs - 1000), false);
 });
 
-test('pre-boot lease: live pid NOT stale, dead pid stale (injected boot time)', () => {
+test('pre-boot lease: live pid NOT stale, dead pid stale', () => {
   const boot = Date.now(), old = boot - 3600e3;
-  assert.equal(isStale({ pid: process.pid, startedAt: old }, boot), false);
-  assert.equal(isStale({ pid: spawnSync('true').pid, childPid: process.pid, startedAt: old }, boot), false);
-  assert.equal(isStale({ pid: spawnSync('true').pid, startedAt: old }, boot), true);
+  assert.equal(isStale({ pid: process.pid, startedAt: old }), false);
+  assert.equal(isStale({ pid: spawnSync('true').pid, childPid: process.pid, startedAt: old }), false);
+  assert.equal(isStale({ pid: spawnSync('true').pid, startedAt: old }), true);
 });
 
 test('legacy run --job (no --class/--prio) is ungated: broken gate.json and full pool do not matter', async () => {
@@ -421,4 +421,19 @@ test('stuck live-owner lock: --max-wait 300 exits 75 in about 300 ms', () => {
   assert.equal(r.status, 75, r.stderr);
   assert.ok(dt < 2500, `took ${dt}ms`);
   assert.ok(fs.existsSync(lock));
+});
+
+test('legacy run --json foo (no --) forwards --json foo to codex exactly as main', () => {
+  const { dir, cli, events } = setup({ gate: '{broken' });
+  const fake = path.join(dir, 'codex.mjs');
+  fs.writeFileSync(fake, '#!/usr/bin/env node\nconsole.log(JSON.stringify(process.argv.slice(2)));\n', { mode: 0o755 });
+  const cfgFile = path.join(dir, 'router.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ codexBin: fake, sessionsDir: path.join(dir, 'ns'), logFile: path.join(dir, 'log.jsonl'), tiers: { normal: ['M1'] } }));
+  let r = cli(['run', '--config', cfgFile, '--json', 'foo']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout.trim().split('\n').pop()), ['exec', '-m', 'M1', '--json', 'foo']);
+  r = cli(['run', '--config', cfgFile, '--max-wait', 'x', 'foo']); // stray gate flag passes through
+  assert.equal(r.status, 0, r.stderr);
+  assert.deepEqual(JSON.parse(r.stdout.trim().split('\n').pop()), ['exec', '-m', 'M1', '--max-wait', 'x', 'foo']);
+  assert.deepEqual(events(), []);
 });
