@@ -78,7 +78,8 @@ function startWatchdog(pgid, tag) {
     const grace = String(Number(process.env.JOB_ROUTER_WATCHDOG_GRACE_MS) || 3000);
     const w = spawn(process.execPath, ['-e', WATCHDOG_JS, String(pgid), grace, `job-router-watchdog:${tag}`],
       { stdio: ['pipe', 'ignore', 'ignore'], detached: true });
-    w.on('error', () => {}); w.stdin.on('error', () => {});
+    w.on('error', (e) => console.error(`job-router: warning: orphan watchdog failed to start: ${e.message}`));
+    w.stdin.on('error', () => {});
     w.unref();
     // Resolves once "done" is flushed to the pipe (or after 1 s), so process.exit can't drop it.
     return { stop: () => new Promise((r) => { setTimeout(r, 1000).unref(); try { w.stdin.end('done\n', r); } catch { r(); } }) };
@@ -89,7 +90,8 @@ function runChild(bin, args, env, onSpawn = () => {}) {
   return new Promise((resolve) => {
     const child = spawn(bin, args, { stdio: 'inherit', env, detached: true }); // own process group
     if (child.pid) onSpawn(child.pid);
-    const dog = child.pid ? startWatchdog(child.pid, env.JOB_ROUTER_LEASE || '') : null;
+    // Only when a lease is held; ungated paths (legacy run, critical bypass) spawn nothing extra.
+    const dog = child.pid && env.JOB_ROUTER_LEASE ? startWatchdog(child.pid, env.JOB_ROUTER_LEASE) : null;
     const fwd = ['SIGINT', 'SIGTERM', 'SIGHUP'].map((s) => {
       const h = () => { try { process.kill(-child.pid, s); } catch { try { child.kill(s); } catch {} } };
       process.on(s, h); return [s, h];

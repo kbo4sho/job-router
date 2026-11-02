@@ -574,3 +574,20 @@ test('watchdog: a normal exit never signals the group (backgrounded sleep surviv
   try { process.kill(b, 'SIGKILL'); } catch {}
   assert.ok(aliveNow, 'backgrounded sleep must survive a normal exit');
 });
+
+test('ungated paths spawn no watchdog (legacy run, critical bypass)', () => {
+  const { dir, cli } = setup({ gate: '{broken' });
+  const probe = path.join(dir, 'probe.sh');
+  fs.writeFileSync(probe, '#!/bin/sh\npgrep -f "job-router-watchdog:" >/dev/null && echo dog || echo nodog\n', { mode: 0o755 });
+  const fake = path.join(dir, 'codex.mjs');
+  fs.writeFileSync(fake, `#!/usr/bin/env node\nconst r=require('child_process').spawnSync(${JSON.stringify(probe)},{encoding:'utf8'});console.log(r.stdout.trim());\n`, { mode: 0o755 });
+  fs.renameSync(fake, fake.replace(/mjs$/, 'cjs'));
+  const cfgFile = path.join(dir, 'router.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ codexBin: fake.replace(/mjs$/, 'cjs'), sessionsDir: path.join(dir, 'ns'), logFile: path.join(dir, 'log.jsonl'), tiers: { normal: ['M1'] } }));
+  const legacy = cli(['run', '--config', cfgFile, '--', 'hi']);
+  assert.equal(legacy.status, 0, legacy.stderr); assert.match(legacy.stdout, /nodog/);
+  const bypass = cli(['run', '--class', 'codex', '--prio', 'critical', '--', probe]);
+  assert.equal(bypass.status, 0, bypass.stderr); assert.equal(bypass.stdout.trim(), 'nodog');
+  const gated = setup().cli(['run', '--class', 'codex', '--', probe]);
+  assert.equal(gated.stdout.trim(), 'dog'); // sanity: gated run does start one
+});
