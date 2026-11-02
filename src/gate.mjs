@@ -256,7 +256,9 @@ export function readLeases(stateDir) {
 
 // Process start times via ONE ps call (pid-reuse guard). TZ/locale pinned so the string is stable.
 // Returns Map(pid -> lstart) or null if ps fails (callers then fall back to kill-only).
-export function procStarts(pids, ps = process.env.JOB_ROUTER_PS || 'ps') {
+let PS_BIN = 'ps';
+export const _setPsForTests = (bin) => { PS_BIN = bin || 'ps'; }; // test-only injection
+export function procStarts(pids, ps = PS_BIN) {
   const list = [...new Set(pids.filter((p) => p > 0))];
   if (!list.length) return new Map();
   try {
@@ -386,7 +388,8 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
   process.once('exit', () => release());
   const setChildPid = (childPid) => {
     if (released) return; // never resurrect a released lease
-    try { const rec = JSON.parse(fs.readFileSync(leaseFile, 'utf8')); rec.childPid = childPid; rec.childStart = procStart(childPid) || undefined; writeAtomic(leaseFile, JSON.stringify(rec)); } catch {}
+    const childStart = procStart(childPid) || undefined;
+    try { const rec = JSON.parse(fs.readFileSync(leaseFile, 'utf8')); rec.childPid = childPid; rec.childStart = childStart; writeAtomic(leaseFile, JSON.stringify(rec)); } catch {}
   };
   return { id, inherited: false, release, setChildPid, env: { ...(c.env || {}), JOB_ROUTER_LEASE: id } };
 }

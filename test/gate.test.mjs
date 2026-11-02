@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { status, procStart, LOCK_LOST, flockAcquire, logEvent, acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, isStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
+import { _setPsForTests, procStarts, status, procStart, LOCK_LOST, flockAcquire, logEvent, acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, isStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bin = path.join(here, '..', 'bin', 'job-router.mjs');
@@ -546,12 +546,12 @@ test('pid start time: mismatch on a live pid is stale; no start time or ps failu
   assert.equal(isStale({ pid: process.pid, pidStart: bogus }), true);           // reused pid
   assert.equal(isStale({ pid: process.pid }), false);                            // legacy lease
   assert.equal(isStale({ pid: spawnSync('true').pid, childPid: process.pid, childStart: bogus }), true);
-  const prev = process.env.JOB_ROUTER_PS;
-  process.env.JOB_ROUTER_PS = '/nonexistent/ps';
+  _setPsForTests('/nonexistent/ps');
   try {
+    assert.equal(procStarts([process.pid]), null);
     assert.equal(procStart(process.pid), null);
     assert.equal(isStale({ pid: process.pid, pidStart: bogus }), false);         // ps failure: kill-only
-  } finally { if (prev === undefined) delete process.env.JOB_ROUTER_PS; else process.env.JOB_ROUTER_PS = prev; }
+  } finally { _setPsForTests(null); }
   const { acq, env } = setup();
   const l = await acq('codex');
   assert.equal(readLeases(env.JOB_ROUTER_STATE_DIR)[0].pidStart, me);            // recorded on acquire
@@ -577,11 +577,10 @@ test('N leases cost one ps call per pass', () => {
   const ld = path.join(env.JOB_ROUTER_STATE_DIR, 'leases'); fs.mkdirSync(ld, { recursive: true });
   kids.forEach((k, i) => fs.writeFileSync(path.join(ld, `codex.${i}.json`), JSON.stringify({
     id: `codex.${i}`, pid: process.pid, pidStart: procStart(process.pid), childPid: k.pid, childStart: procStart(k.pid), class: 'codex', weight: 1, startedAt: Date.now() })));
-  const prev = process.env.JOB_ROUTER_PS;
-  process.env.JOB_ROUTER_PS = fakePs;
+  _setPsForTests(fakePs);
   try {
     const st = status(cfg(), env);
     assert.equal(st.leases.length, 3);
     assert.equal(fs.readFileSync(counter, 'utf8').trim().split('\n').length, 1);
-  } finally { if (prev === undefined) delete process.env.JOB_ROUTER_PS; else process.env.JOB_ROUTER_PS = prev; kids.forEach((k) => k.kill('SIGKILL')); }
+  } finally { _setPsForTests(null); kids.forEach((k) => k.kill('SIGKILL')); }
 });
