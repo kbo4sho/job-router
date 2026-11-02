@@ -372,3 +372,25 @@ test('--prio accepts only normal or critical', () => {
   assert.equal(r.status, 2); assert.match(r.stderr, /--prio must be normal or critical/);
   assert.equal(cli(['run', '--class', 'codex', '--prio', 'normal', '--', 'true']).status, 0);
 });
+
+test('lock that predates boot is stale even with a live owner (injected boot time)', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jrg-boot-'));
+  const lock = path.join(dir, 'lock.d'); fs.mkdirSync(lock);
+  fs.writeFileSync(path.join(lock, 'owner'), `${process.pid}.n`);
+  const mt = fs.statSync(lock).mtimeMs;
+  assert.equal(lockIsStale(lock, 10000, mt - 1000), false);
+  assert.equal(lockIsStale(lock, 10000, mt + 1000), true);
+});
+
+test('stuck live-owner lock: --max-wait 300 exits 75 in about 300 ms', () => {
+  const { env, cli } = setup();
+  const lock = path.join(env.JOB_ROUTER_STATE_DIR, 'lock.d');
+  fs.mkdirSync(lock, { recursive: true });
+  fs.writeFileSync(path.join(lock, 'owner'), `${process.pid}.held`);
+  const t0 = Date.now();
+  const r = cli(['run', '--class', 'codex', '--max-wait', '300', '--', 'true']);
+  const dt = Date.now() - t0;
+  assert.equal(r.status, 75, r.stderr);
+  assert.ok(dt < 2500, `took ${dt}ms`);
+  assert.ok(fs.existsSync(lock));
+});

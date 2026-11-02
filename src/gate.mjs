@@ -101,9 +101,10 @@ export function writeAtomic(file, data) {
 const readOwner = (dir) => { try { return fs.readFileSync(path.join(dir, 'owner'), 'utf8'); } catch { return null; } };
 const inoOf = (dir) => { try { return fs.statSync(dir).ino; } catch { return null; } };
 
-// Stale = owner pid dead. Only when the owner file is missing (creation window) fall back to age.
+// Stale = predates boot, or owner pid dead. Only when the owner file is missing (creation window) fall back to age.
 // A live but paused holder is never stale.
-export function lockIsStale(dir, staleLockMs) {
+export function lockIsStale(dir, staleLockMs, boot = bootTimeMs()) {
+  try { if (fs.statSync(dir).mtimeMs < boot) return true; } catch { return false; } // predates boot
   const owner = readOwner(dir);
   if (owner) { const pid = parseInt(owner, 10); return pid > 0 ? !alive(pid) : true; }
   try { return Date.now() - fs.statSync(dir).mtimeMs > staleLockMs; } catch { return false; }
@@ -125,10 +126,11 @@ export function tryStealLock(lock, observed) {
 export const releaseLock = tryStealLock;
 
 // Atomic mkdir mutex. fn receives owns(): true while lock.d is still ours (inode + nonce).
-export async function withLock(stateDir, staleLockMs, fn) {
+// budgetMs caps the wait; on deadline returns LOCK_LOST so callers apply their own timeout.
+export async function withLock(stateDir, staleLockMs, fn, budgetMs = Infinity) {
   const lock = path.join(stateDir, 'lock.d');
   fs.mkdirSync(stateDir, { recursive: true });
-  const deadline = Date.now() + Math.max(staleLockMs * 3, 5000);
+  const deadline = Date.now() + Math.min(Math.max(staleLockMs * 3, 5000), budgetMs);
   let me;
   for (;;) {
     try {
@@ -139,7 +141,7 @@ export async function withLock(stateDir, staleLockMs, fn) {
         // No owner file = not a valid hold. Drop it and retry like contention.
         try { fs.rmSync(lock, { recursive: true, force: true }); } catch {}
         logEvent(stateDir, { event: 'lock_owner_write_failed', error: we.message });
-        if (Date.now() > deadline) throw new GateError(`gate lock ${lock}: cannot write owner (${we.message})`);
+        if (Date.now() > deadline) return LOCK_LOST;
         await sleep(20 + Math.random() * 30);
         continue;
       }
@@ -150,7 +152,7 @@ export async function withLock(stateDir, staleLockMs, fn) {
       if (lockIsStale(lock, staleLockMs)) {
         if (tryStealLock(lock, observed)) { logEvent(stateDir, { event: 'lock_steal' }); continue; }
       }
-      if (Date.now() > deadline) throw new GateError(`gate lock ${lock} stuck`);
+      if (Date.now() > deadline) return LOCK_LOST;
       await sleep(20 + Math.random() * 30);
     }
   }
@@ -244,7 +246,7 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
           logEvent(stateDir, { event: 'acquire', class: cls, prio, leaseId: id, pid: process.pid, waitMs: Date.now() - t0, used, pool: cfg.poolUnits, load1: s.load1, ncpu: s.ncpu });
         }
         return why;
-      });
+      }, Math.max(10, wait - (Date.now() - t0)));
       if (!reason) break;
       if (reason === LOCK_LOST) logEvent(stateDir, { event: 'lock_lost', class: cls, leaseId: id });
       else if (reason !== lastReason) { logEvent(stateDir, { event: 'deny', class: cls, prio, leaseId: id, reason, load1: s.load1 }); lastReason = reason; }
