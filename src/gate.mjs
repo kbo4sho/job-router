@@ -72,6 +72,7 @@ export function loadGateConfig(file = defaultGateConfigPath(), env = process.env
     if (!(c.cap >= 1) || !(c.weight >= 1)) throw new GateError(`gate config: class ${k} needs cap>=1 and weight>=1`);
   }
   if (!(cfg.poolUnits >= 1)) throw new GateError('gate config: poolUnits must be >= 1');
+  if (!(cfg.reserveCritical >= 0 && cfg.reserveCritical < cfg.poolUnits)) throw new GateError(`gate config: reserveCritical must be >= 0 and < poolUnits (${cfg.poolUnits})`);
   return cfg;
 }
 
@@ -258,7 +259,9 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
   };
   process.once('exit', () => release());
   const setChildPid = (childPid) => {
+    if (released) return; // never resurrect a released lease
     try { const rec = JSON.parse(fs.readFileSync(leaseFile, 'utf8')); rec.childPid = childPid; writeAtomic(leaseFile, JSON.stringify(rec)); } catch {}
+    if (released) try { fs.unlinkSync(leaseFile); } catch {}
   };
   return { id, inherited: false, release, setChildPid, env: { ...(c.env || {}), JOB_ROUTER_LEASE: id } };
 }

@@ -306,3 +306,19 @@ test('release with a foreign nonce leaves lock.d; ownership-lost commit aborts',
   assert.equal(fs.readFileSync(path.join(dir, 'lock.d', 'owner'), 'utf8'), 'foreign.nonce');
   assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes('.stale.')), []);
 });
+
+test('setChildPid after release does not resurrect the lease', async () => {
+  const { acq, env } = setup();
+  const l = await acq('codex');
+  l.release(); l.setChildPid(process.pid);
+  assert.deepEqual(readLeases(env.JOB_ROUTER_STATE_DIR), []);
+});
+
+test('reserveCritical outside [0, poolUnits) is invalid config (exit 2)', () => {
+  for (const reserveCritical of [12, -1, 'x']) {
+    const bad = setup({ gate: { reserveCritical } });
+    assert.throws(() => bad.cfg(), /reserveCritical/);
+    assert.equal(bad.cli(['run', '--class', 'codex', '--', 'true']).status, 2);
+  }
+  assert.doesNotThrow(() => setup({ gate: { reserveCritical: 0 } }).cfg());
+});
