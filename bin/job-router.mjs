@@ -60,15 +60,43 @@ async function gated(cls, cmdline) {
   return acquire(gcfg, { cls, prio: opts.prio, maxWaitMs: opts.maxWait, cmd: cmdline.join(' ').slice(0, 200) });
 }
 
-function runChild(bin, args, env, onSpawn = () => {}) {
+// Orphan watchdog: a tiny detached node process holding a pipe from us. If the pipe hits EOF
+// without "done" (we died, even by SIGKILL), it TERMs the child's process group, then KILLs
+// it after a grace period. On a normal finish we write "done" and it exits at once.
+const WATCHDOG_JS = `const [pg, grace] = [Number(process.argv[1]), Number(process.argv[2])]; let buf = '';
+process.stdin.on('data', (d) => { buf += d; }); process.stdin.on('error', () => {});
+process.stdin.on('end', () => {
+  if (buf.trim() === 'done') process.exit(0);
+  const up = () => { try { process.kill(-pg, 0); return true; } catch { return false; } };
+  if (!up()) process.exit(0);
+  try { process.kill(-pg, 'SIGTERM'); } catch {}
+  const t0 = Date.now();
+  const iv = setInterval(() => { if (!up()) process.exit(0); if (Date.now() - t0 >= grace) { try { process.kill(-pg, 'SIGKILL'); } catch {} process.exit(0); } }, 100);
+});`;
+function startWatchdog(pgid, tag) {
+  try {
+    const grace = String(Number(process.env.JOB_ROUTER_WATCHDOG_GRACE_MS) || 3000);
+    const w = spawn(process.execPath, ['-e', WATCHDOG_JS, String(pgid), grace, `job-router-watchdog:${tag}`],
+      { stdio: ['pipe', 'ignore', 'ignore'], detached: true });
+    w.on('error', (e) => console.error(`job-router: warning: orphan watchdog failed to start: ${e.message}`));
+    w.stdin.on('error', () => {});
+    w.unref();
+    // Resolves once "done" is flushed to the pipe (or after 1 s), so process.exit can't drop it.
+    return { stop: () => new Promise((r) => { setTimeout(r, 1000).unref(); try { w.stdin.end('done\n', r); } catch { r(); } }) };
+  } catch { return null; }
+}
+
+function runChild(bin, args, env, onSpawn = () => {}, leaseId = null) {
   return new Promise((resolve) => {
     const child = spawn(bin, args, { stdio: 'inherit', env, detached: true }); // own process group
     if (child.pid) onSpawn(child.pid);
+    // Only when this invocation holds (or inherited) a lease; ungated paths spawn nothing extra.
+    const dog = child.pid && leaseId ? startWatchdog(child.pid, leaseId) : null;
     const fwd = ['SIGINT', 'SIGTERM', 'SIGHUP'].map((s) => {
       const h = () => { try { process.kill(-child.pid, s); } catch { try { child.kill(s); } catch {} } };
       process.on(s, h); return [s, h];
     });
-    const done = (code) => { for (const [s, h] of fwd) process.off(s, h); resolve(code); };
+    const done = (code) => { for (const [s, h] of fwd) process.off(s, h); Promise.resolve(dog?.stop()).then(() => resolve(code)); };
     child.on('error', (e) => { console.error(`job-router: cannot run ${bin}: ${e.message}`); done(127); });
     child.on('exit', (code, sig) => done(code ?? 128 + (os.constants.signals[sig] || 0)));
   });
@@ -96,7 +124,8 @@ try {
   } else if (opts.cls) {
     if (!opts.rest.length) throw new GateError('run --class needs a command after --', 2);
     const lease = await gated(opts.cls, opts.rest);
-    const code = await runChild(opts.rest[0], opts.rest.slice(1), { ...process.env, ...lease.env }, (pid) => lease.setChildPid(pid));
+    const code = await runChild(opts.rest[0], opts.rest.slice(1), { ...process.env, ...lease.env }, (pid) => lease.setChildPid(pid),
+      lease.env?.JOB_ROUTER_LEASE ?? (lease.inherited ? lease.id : null));
     lease.release({ exit: code });
     process.exit(code);
   } else {
