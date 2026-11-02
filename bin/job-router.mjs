@@ -24,7 +24,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--gate-config') opts.gateConfig = argv[++i];
   else if (a === '--class') opts.cls = argv[++i];
   else if (a === '--prio') opts.prio = argv[++i];
-  else if (a === '--max-wait') opts.maxWait = Number(argv[++i]);
+  else if (a === '--max-wait') { const v = Number(argv[++i]); opts.maxWait = Number.isFinite(v) && v >= 0 ? v : undefined; }
   else if (a === '--json') opts.json = true;
   else if (a === '--probe') opts.probe = true;
   else { opts.rest = argv.slice(i); break; }
@@ -43,13 +43,14 @@ function gateOrBypass(cls) {
 }
 async function gated(cls, cmdline) {
   const gcfg = gateOrBypass(cls);
-  if (!gcfg) return { release() {}, env: {} };
+  if (!gcfg) return { release() {}, setChildPid() {}, env: {} };
   return acquire(gcfg, { cls, prio: opts.prio, maxWaitMs: opts.maxWait, cmd: cmdline.join(' ').slice(0, 200) });
 }
 
-function runChild(bin, args, env) {
+function runChild(bin, args, env, onSpawn = () => {}) {
   return new Promise((resolve) => {
     const child = spawn(bin, args, { stdio: 'inherit', env });
+    if (child.pid) onSpawn(child.pid);
     const fwd = ['SIGINT', 'SIGTERM', 'SIGHUP'].map((s) => { const h = () => { try { child.kill(s); } catch {} }; process.on(s, h); return [s, h]; });
     const done = (code) => { for (const [s, h] of fwd) process.off(s, h); resolve(code); };
     child.on('error', (e) => { console.error(`job-router: cannot run ${bin}: ${e.message}`); done(127); });
@@ -79,7 +80,7 @@ try {
   } else if (opts.cls) {
     if (!opts.rest.length) throw new GateError('run --class needs a command after --', 2);
     const lease = await gated(opts.cls, opts.rest);
-    const code = await runChild(opts.rest[0], opts.rest.slice(1), { ...process.env, ...lease.env });
+    const code = await runChild(opts.rest[0], opts.rest.slice(1), { ...process.env, ...lease.env }, (pid) => lease.setChildPid(pid));
     lease.release({ exit: code });
     process.exit(code);
   } else {

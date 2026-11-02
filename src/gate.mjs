@@ -85,6 +85,15 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const bootTimeMs = () => Date.now() - os.uptime() * 1000;
 
+function lockIsStale(dir, staleLockMs) {
+  try {
+    const st = fs.statSync(dir);
+    if (Date.now() - st.mtimeMs > staleLockMs) return true;
+    const pid = Number(fs.readFileSync(path.join(dir, 'pid'), 'utf8'));
+    return pid > 0 && !alive(pid);
+  } catch { try { return Date.now() - fs.statSync(dir).mtimeMs > staleLockMs; } catch { return false; } }
+}
+
 // Atomic mkdir mutex with stale-steal (dead holder pid or older than staleLockMs).
 async function withLock(stateDir, staleLockMs, fn) {
   const lock = path.join(stateDir, 'lock.d');
@@ -97,13 +106,18 @@ async function withLock(stateDir, staleLockMs, fn) {
       break;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      let stale = false;
-      try {
-        const st = fs.statSync(lock);
-        const pid = Number(fs.readFileSync(path.join(lock, 'pid'), 'utf8'));
-        stale = Date.now() - st.mtimeMs > staleLockMs || (pid > 0 && !alive(pid));
-      } catch { try { stale = Date.now() - fs.statSync(lock).mtimeMs > staleLockMs; } catch {} }
-      if (stale) { try { fs.rmSync(lock, { recursive: true, force: true }); logEvent(stateDir, { event: 'lock_steal' }); } catch {} continue; }
+      const stale = lockIsStale(lock, staleLockMs);
+      if (stale) {
+        // Steal via atomic rename to a unique tombstone; only the winner of the rename proceeds.
+        const tomb = `${lock}.stale.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+        try { fs.renameSync(lock, tomb); } catch { continue; }
+        if (lockIsStale(tomb, staleLockMs)) {
+          fs.rmSync(tomb, { recursive: true, force: true }); logEvent(stateDir, { event: 'lock_steal' });
+        } else {
+          try { fs.renameSync(tomb, lock); } catch { fs.rmSync(tomb, { recursive: true, force: true }); }
+        }
+        continue;
+      }
       if (Date.now() > deadline) throw new GateError(`gate lock ${lock} stuck`);
       await sleep(20 + Math.random() * 30);
     }
@@ -124,7 +138,7 @@ export function readLeases(stateDir) {
 }
 
 export function isStale(l, boot = bootTimeMs()) {
-  return l.corrupt || !(l.pid > 0) || !alive(l.pid) || (l.startedAt && l.startedAt < boot - 60000);
+  return l.corrupt || !(l.pid > 0) || (!alive(l.pid) && !(l.childPid > 0 && alive(l.childPid))) || (l.startedAt && l.startedAt < boot - 60000);
 }
 
 function reap(stateDir) {
@@ -158,7 +172,7 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
   const stateDir = stateDirOf(cfg, env);
   if (env.JOB_ROUTER_LEASE) {
     logEvent(stateDir, { event: 'inherit', class: cls, leaseId: env.JOB_ROUTER_LEASE, pid: process.pid });
-    return { id: env.JOB_ROUTER_LEASE, inherited: true, release() {} };
+    return { id: env.JOB_ROUTER_LEASE, inherited: true, release() {}, setChildPid() {} };
   }
   const c = cfg.classes[cls];
   if (!c) throw new GateError(`unknown class "${cls}" (known: ${Object.keys(cfg.classes).join(', ')})`);
@@ -202,7 +216,10 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
     logEvent(stateDir, { event: 'release', class: cls, leaseId: id, durMs: Date.now() - t0, ...extra });
   };
   process.once('exit', () => release());
-  return { id, inherited: false, release, env: { ...(c.env || {}), JOB_ROUTER_LEASE: id } };
+  const setChildPid = (childPid) => {
+    try { const rec = JSON.parse(fs.readFileSync(leaseFile, 'utf8')); rec.childPid = childPid; fs.writeFileSync(leaseFile, JSON.stringify(rec)); } catch {}
+  };
+  return { id, inherited: false, release, setChildPid, env: { ...(c.env || {}), JOB_ROUTER_LEASE: id } };
 }
 
 export function status(cfg, env = process.env) {

@@ -65,13 +65,15 @@ test('lease of a dead pid is reaped', async () => {
   l.release();
 });
 
-test('stale mkdir lock is stolen', async () => {
-  const { acq, env } = setup({ gate: { staleLockMs: 50 } });
+test('stale mkdir lock is stolen via tombstone rename', async () => {
+  const { acq, env, events } = setup({ gate: { staleLockMs: 50 } });
   const lock = path.join(env.JOB_ROUTER_STATE_DIR, 'lock.d');
   fs.mkdirSync(lock, { recursive: true });
   fs.writeFileSync(path.join(lock, 'pid'), String(process.pid)); // live pid, only age makes it stale
   const old = new Date(Date.now() - 1000); fs.utimesSync(lock, old, old);
   (await acq('codex')).release();
+  assert.deepEqual(fs.readdirSync(env.JOB_ROUTER_STATE_DIR).filter((n) => n.includes('.stale.')), []);
+  assert.ok(events().some((e) => e.event === 'lock_steal'));
 });
 
 test('critical bypasses the load check and the reserve holds for it', async () => {
@@ -145,4 +147,26 @@ test('status --json reports leases, pool, load and caps', async () => {
   l.release();
   assert.equal(s.classes.codex.held, 1); assert.equal(s.pool.used, 1); assert.equal(s.pool.units, 12);
   assert.equal(s.loadPerCore, 0.5); assert.equal(s.classes.ocr.cap, 4);
+});
+
+test('lease with dead wrapper but live child pid is not reaped; child pid recorded', async () => {
+  const { acq, env, cli } = setup();
+  const dead = spawnSync('true').pid;
+  const dir = path.join(env.JOB_ROUTER_STATE_DIR, 'leases');
+  fs.mkdirSync(dir, { recursive: true });
+  fs.writeFileSync(path.join(dir, 'build.orphan.json'), JSON.stringify({ id: 'build.orphan', pid: dead, childPid: process.pid, class: 'build', weight: 6, startedAt: Date.now() }));
+  await assert.rejects(acq('build', { maxWaitMs: 50 }), (e) => e.exitCode === EX_TEMPFAIL);
+  fs.unlinkSync(path.join(dir, 'build.orphan.json'));
+  const r = cli(['run', '--class', 'codex', '--', process.execPath, '-e',
+    `const fs=require('fs'),p=require('path');const d=${JSON.stringify(dir)};const l=JSON.parse(fs.readFileSync(p.join(d,fs.readdirSync(d)[0])));console.log(l.childPid===process.pid)`]);
+  assert.equal(r.stdout.trim(), 'true', r.stderr);
+});
+
+test('--max-wait that is not a finite non-negative number falls back to config default', async () => {
+  const { acq, cli } = setup({ gate: { queueTimeoutMs: 150 } });
+  const l = await acq('build');
+  const r = cli(['run', '--class', 'build', '--max-wait', 'abc', '--', 'true']);
+  const r2 = cli(['run', '--class', 'build', '--max-wait', '-5', '--', 'true']);
+  l.release();
+  assert.equal(r.status, 75, r.stderr); assert.equal(r2.status, 75, r2.stderr);
 });
