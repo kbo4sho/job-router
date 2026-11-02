@@ -458,15 +458,18 @@ test('deny is logged once per reason category, not per load change', async () =>
   assert.equal(events().filter((e) => e.event === 'deny').length, 1);
 });
 
-test('weight_clamped logged once per config load when reserve forces a default weight lower', () => {
+test('weight_clamped logged by gated runs only; status and config loading write no events', async () => {
   const big = setup();                       // 14 cpu: nothing clamped
-  big.cfg();
+  (await big.acq('codex')).release();
   assert.ok(!big.events().some((e) => e.event === 'weight_clamped'));
   const t = setup({ gate: { reserveCritical: 8 } }); // pool 12, max weight 4 -> build 6 clamped
   t.cfg();
+  assert.equal(t.cli(['status', '--json']).status, 0);
+  assert.deepEqual(t.events(), []);                  // read-only
+  (await t.acq('codex')).release();
   const ev = t.events().filter((e) => e.event === 'weight_clamped');
   assert.deepEqual(ev.map((e) => [e.class, e.from, e.to]), [['build', 6, 4]]);
   const user = setup({ gate: { reserveCritical: 8, classes: { build: { weight: 3 } } } }); // explicit weight: no event
-  user.cfg();
+  (await user.acq('codex')).release();
   assert.ok(!user.events().some((e) => e.event === 'weight_clamped'));
 });

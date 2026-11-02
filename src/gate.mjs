@@ -25,13 +25,14 @@ export function hostLoad1(env = process.env) {
 }
 
 // Default weights before any clamp to poolUnits - reserveCritical.
+export const poolUnitsFor = (ncpu) => Math.max(1, ncpu - 2); // two cores kept for UI/daemons
 export function nominalWeights(ncpu = hostNcpu()) {
-  const pool = Math.max(1, ncpu - 2);
+  const pool = poolUnitsFor(ncpu);
   return { ocr: 1, pdf: 1, build: Math.max(1, Math.floor(pool / 2)), codex: 1, imagegen: 4, ollama: 4 };
 }
 
 export function defaultGateConfig(ncpu = hostNcpu()) {
-  const pool = Math.max(1, ncpu - 2);
+  const pool = poolUnitsFor(ncpu);
   const reserve = Math.max(1, Math.floor(pool / 4));
   const maxW = Math.max(1, pool - reserve); // heaviest weight a normal-priority job can be admitted with
   const w = (n) => Math.max(1, Math.min(maxW, n));
@@ -83,7 +84,8 @@ export function loadGateConfig(file = defaultGateConfigPath(), env = process.env
   }
   if (!(cfg.poolUnits >= 1)) throw new GateError('gate config: poolUnits must be >= 1');
   if (!(cfg.reserveCritical >= 0 && cfg.reserveCritical < cfg.poolUnits)) throw new GateError(`gate config: reserveCritical must be >= 0 and < poolUnits (${cfg.poolUnits})`);
-  for (const c of clamped) logEvent(stateDirOf(cfg, env), { event: 'weight_clamped', ...c, maxWeight: maxW });
+  // Not logged here (status must stay read-only); acquire() logs these for gated runs.
+  Object.defineProperty(cfg, 'clamped', { value: clamped.map((c) => ({ ...c, maxWeight: maxW })), enumerable: false });
   return cfg;
 }
 
@@ -248,6 +250,7 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
   }
   const c = cfg.classes[cls];
   if (!c) throw new GateError(`unknown class "${cls}" (known: ${Object.keys(cfg.classes).join(', ')})`);
+  for (const c of cfg.clamped || []) logEvent(stateDir, { event: 'weight_clamped', ...c });
   const id = `${cls}.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
   const leaseFile = path.join(stateDir, 'leases', `${id}.json`);
   const waitFile = path.join(stateDir, 'waiters', `${id}.json`);
