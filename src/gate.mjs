@@ -26,11 +26,13 @@ export function hostLoad1(env = process.env) {
 
 export function defaultGateConfig(ncpu = hostNcpu()) {
   const pool = Math.max(1, ncpu - 2);
-  const w = (n) => Math.max(1, Math.min(pool, n));
+  const reserve = Math.max(1, Math.floor(pool / 4));
+  const maxW = Math.max(1, pool - reserve); // heaviest weight a normal-priority job can be admitted with
+  const w = (n) => Math.max(1, Math.min(maxW, n));
   return {
     stateDir: '~/.local/state/job-router/gate',
     poolUnits: pool,
-    reserveCritical: Math.max(1, Math.floor(pool / 4)), // units only critical may use
+    reserveCritical: reserve, // units only critical may use
     maxLoadPerCore: 1.0,                                  // heavy classes admitted only below this
     queueTimeoutMs: 30 * 60 * 1000,
     pollMs: 500,
@@ -63,7 +65,10 @@ export function loadGateConfig(file = defaultGateConfigPath(), env = process.env
   const cfg = { ...base, ...raw, classes: { ...base.classes } };
   for (const [k, v] of Object.entries(raw.classes || {})) cfg.classes[k] = { ...(base.classes[k] || { cap: 1, weight: 1, heavy: true }), ...v };
   if (env.JOB_ROUTER_STATE_DIR) cfg.stateDir = env.JOB_ROUTER_STATE_DIR;
+  const maxW = Math.max(1, cfg.poolUnits - (cfg.reserveCritical || 0));
   for (const [k, c] of Object.entries(cfg.classes)) {
+    if (!(raw.classes?.[k]?.weight >= 0) && c.weight > maxW) c.weight = maxW; // re-clamp defaults
+    if (c.weight > maxW) throw new GateError(`gate config: class ${k} weight ${c.weight} > poolUnits-reserveCritical (${maxW}); it could never be admitted`);
     if (!(c.cap >= 1) || !(c.weight >= 1)) throw new GateError(`gate config: class ${k} needs cap>=1 and weight>=1`);
   }
   if (!(cfg.poolUnits >= 1)) throw new GateError('gate config: poolUnits must be >= 1');
@@ -94,6 +99,24 @@ function lockIsStale(dir, staleLockMs) {
   } catch { try { return Date.now() - fs.statSync(dir).mtimeMs > staleLockMs; } catch { return false; } }
 }
 
+const readOwner = (dir) => { try { return fs.readFileSync(path.join(dir, 'owner'), 'utf8'); } catch { return null; } };
+const inoOf = (dir) => { try { return fs.statSync(dir).ino; } catch { return null; } };
+
+// Steal a lock judged stale, identified by (inode, owner nonce) observed at judgement time.
+// Rename to a unique tombstone; delete only if the tombstone is the exact lock we judged.
+// Otherwise (someone's fresh lock) try to put it back; if lock.d already exists, leave the
+// tombstone in place and report failure so the caller backs off. Never deletes a live lock.
+export function tryStealLock(lock, observed) {
+  const tomb = `${lock}.stale.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+  try { fs.renameSync(lock, tomb); } catch { return false; }
+  if (observed.ino != null && inoOf(tomb) === observed.ino && readOwner(tomb) === observed.owner) {
+    fs.rmSync(tomb, { recursive: true, force: true });
+    return true;
+  }
+  try { fs.renameSync(tomb, lock); } catch {}
+  return false;
+}
+
 // Atomic mkdir mutex with stale-steal (dead holder pid or older than staleLockMs).
 async function withLock(stateDir, staleLockMs, fn) {
   const lock = path.join(stateDir, 'lock.d');
@@ -102,21 +125,16 @@ async function withLock(stateDir, staleLockMs, fn) {
   for (;;) {
     try {
       fs.mkdirSync(lock);
-      try { fs.writeFileSync(path.join(lock, 'pid'), String(process.pid)); } catch {}
+      try {
+        fs.writeFileSync(path.join(lock, 'owner'), `${process.pid}.${crypto.randomBytes(6).toString('hex')}`);
+        fs.writeFileSync(path.join(lock, 'pid'), String(process.pid));
+      } catch {}
       break;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
-      const stale = lockIsStale(lock, staleLockMs);
-      if (stale) {
-        // Steal via atomic rename to a unique tombstone; only the winner of the rename proceeds.
-        const tomb = `${lock}.stale.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
-        try { fs.renameSync(lock, tomb); } catch { continue; }
-        if (lockIsStale(tomb, staleLockMs)) {
-          fs.rmSync(tomb, { recursive: true, force: true }); logEvent(stateDir, { event: 'lock_steal' });
-        } else {
-          try { fs.renameSync(tomb, lock); } catch { fs.rmSync(tomb, { recursive: true, force: true }); }
-        }
-        continue;
+      const observed = { ino: inoOf(lock), owner: readOwner(lock) };
+      if (lockIsStale(lock, staleLockMs)) {
+        if (tryStealLock(lock, observed)) { logEvent(stateDir, { event: 'lock_steal' }); continue; }
       }
       if (Date.now() > deadline) throw new GateError(`gate lock ${lock} stuck`);
       await sleep(20 + Math.random() * 30);
@@ -170,8 +188,10 @@ export function decide(cfg, leases, { cls, prio, load1, ncpu }) {
 export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env = process.env,
   sample = () => ({ load1: hostLoad1(env), ncpu: hostNcpu(env) }) } = {}) {
   const stateDir = stateDirOf(cfg, env);
-  // Inherit only a lease of the same class; a different class goes through normal admission.
-  if (env.JOB_ROUTER_LEASE && env.JOB_ROUTER_LEASE.split('.')[0] === cls) {
+  // Inherit a lease of the same class or the same exclusive group (imagegen/ollama); others go through normal admission.
+  const parentCls = env.JOB_ROUTER_LEASE?.split('.')[0];
+  const related = parentCls && (parentCls === cls || (cfg.exclusive || []).some((g) => g.includes(cls) && g.includes(parentCls)));
+  if (related) {
     logEvent(stateDir, { event: 'inherit', class: cls, leaseId: env.JOB_ROUTER_LEASE, pid: process.pid });
     return { id: env.JOB_ROUTER_LEASE, inherited: true, release() {}, setChildPid() {} };
   }

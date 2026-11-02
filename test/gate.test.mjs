@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { acquire, loadGateConfig, defaultGateConfig, readLeases, EX_TEMPFAIL } from '../src/gate.mjs';
+import { acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, EX_TEMPFAIL } from '../src/gate.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bin = path.join(here, '..', 'bin', 'job-router.mjs');
@@ -192,4 +192,37 @@ test('nested call of a different class takes its own lease and is capped', async
   const capped = cli(['run', '--class', 'codex', '--', ...inner]);
   held.release();
   assert.equal(capped.status, 75, capped.stderr);
+});
+
+test('lock steal never deletes a lock whose owner nonce differs from what was judged stale', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jrg-lock-'));
+  const lock = path.join(dir, 'lock.d');
+  fs.mkdirSync(lock); fs.writeFileSync(path.join(lock, 'owner'), 'fresh.owner');
+  const ino = fs.statSync(lock).ino;
+  assert.equal(tryStealLock(lock, { ino, owner: 'old.owner' }), false);
+  assert.equal(fs.readFileSync(path.join(lock, 'owner'), 'utf8'), 'fresh.owner'); // put back intact
+  fs.mkdirSync(path.join(dir, 'other')); fs.writeFileSync(path.join(dir, 'other', 'owner'), 'x');
+  assert.equal(tryStealLock(lock, { ino: fs.statSync(path.join(dir, 'other')).ino, owner: 'fresh.owner' }), false);
+  assert.ok(fs.existsSync(lock));
+  assert.equal(tryStealLock(lock, { ino: fs.statSync(lock).ino, owner: 'fresh.owner' }), true);
+  assert.ok(!fs.existsSync(lock));
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes('.stale.')), []);
+});
+
+test('small-pool host (4 cpu): default weights fit pool-reserve; oversized user weight fails closed', async () => {
+  const d = defaultGateConfig(4);
+  for (const c of Object.values(d.classes)) assert.ok(c.weight <= d.poolUnits - d.reserveCritical);
+  const { acq } = setup({ ncpu: 4 });
+  for (const cls of ['build', 'imagegen']) (await acq(cls)).release();
+  const bad = setup({ ncpu: 4, gate: { classes: { build: { weight: 5 } } } });
+  assert.throws(() => bad.cfg(), /could never be admitted/);
+  assert.equal(bad.cli(['run', '--class', 'build', '--', 'true']).status, 2);
+});
+
+test('nested ollama under an imagegen lease inherits it (same exclusive group)', () => {
+  const { cli, events } = setup();
+  const r = cli(['run', '--class', 'imagegen', '--', process.execPath, bin, 'run', '--class', 'ollama', '--max-wait', '0', '--',
+    process.execPath, '-e', 'process.exit(0)']);
+  assert.equal(r.status, 0, r.stderr);
+  assert.ok(events().some((e) => e.event === 'inherit' && e.class === 'ollama' && /^imagegen\./.test(e.leaseId)));
 });
