@@ -1,3 +1,3 @@
 { "name": "job-router", "version": "0.1.0", "private": true, "type": "module",
   "bin": { "job-router": "bin/job-router.mjs" },
-  "scripts": { "test": "node --test test/router.test.mjs" }, "engines": { "node": ">=20" } }
+  "scripts": { "test": "node --test --test-concurrency=1 test/router.test.mjs test/gate.test.mjs" }, "engines": { "node": ">=20" } }

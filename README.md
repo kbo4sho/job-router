@@ -29,8 +29,28 @@ whole group is SIGTERM'd then SIGKILL'd at the timeout (no `timeout(1)` needed o
 
 Log: `~/.local/state/job-router/log.jsonl` (`attempt`, `fallback` with `reason`, `success`, `error`, `exhausted`).
 
+## Admission gate (load-aware)
+How bots call it: `job-router run --class <ocr|pdf|build|codex|imagegen|ollama> [--prio critical] -- <cmd...>` (exit 75 = queue timeout, retry later).
+
+```sh
+job-router run --class ocr -- tesseract in.png out            # OMP_THREAD_LIMIT=1 injected
+job-router run --class build --prio critical -- npm run build  # nightly build: never blocked by load
+job-router run --class pdf --max-wait 600000 -- gs ...         # custom queue timeout (ms)
+job-router status [--json]                                     # leases per class, waiters, pool, load/core, caps
+```
+- stdio is passed through and the child's exit code is propagated. Exit 75 (EX_TEMPFAIL) on queue timeout (`queueTimeoutMs`, default 30 min, or `--max-wait`).
+- Shared pool of `cpus − 2` units. Defaults on 14 CPUs: ocr cap 4/weight 1, pdf 3/1, build 1/6, codex 3/1, imagegen 1/4, ollama 1/4; imagegen and ollama are mutually exclusive. Weights are clamped to `poolUnits − reserveCritical`; a configured weight above that is rejected as invalid config. `reserveCritical` units (default pool/4, i.e. 3 of 12) are usable only by `--prio critical`.
+- Heavy classes (build, ocr, pdf, imagegen, ollama) are admitted only while `load1/cpus < maxLoadPerCore` (default 1.0). `--prio critical` skips the load check and the class cap and may use the reserve, but still respects imagegen/ollama exclusivity.
+- Legacy `run` / `run --job ...` (the Codex ladder) is **ungated** and behaves exactly as before; `gate.json` is not even read. Add `--prio normal|critical` to make it hold a `codex` lease while it runs.
+- Config: `~/.config/job-router/gate.json` (env `JOB_ROUTER_GATE_CONFIG`, or `--gate-config`). Keys: `stateDir`, `poolUnits`, `reserveCritical`, `maxLoadPerCore`, `queueTimeoutMs`, `pollMs`, `staleLockMs`, `exclusive`, `classes{name:{cap,weight,heavy,env}}`. Missing file = defaults. A broken file affects only gated calls (`--class` or `--prio`): it fails closed (exit 2), except `--prio critical`, which runs ungated and logs `gate_bypass`.
+- State: lease files in `~/.local/state/job-router/gate/` (env `JOB_ROUTER_STATE_DIR`), guarded by an atomic `mkdir lock.d` mutex (with an owner nonce) that is stolen only when its owner pid is dead (or, with no owner file yet, after `staleLockMs`), via a rename verified against the observed nonce. There is no daemon. Leases whose pid is dead or that predate boot are reaped on every acquire. Children get `JOB_ROUTER_LEASE`, so nested `job-router` calls of the same class, or of the same exclusive group (imagegen/ollama), inherit the lease; a nested call of a different class acquires its own lease through normal admission.
+- Stopping: send SIGTERM or SIGINT to `job-router` (it forwards to the child's process group and releases the lease). Do not SIGKILL it: the child group would be orphaned (its lease is reaped once the pids die). launchd plists that use `run --class` should set a generous `ExitTimeOut` so launchd doesn't escalate to SIGKILL. Follow-up: an orphan watchdog.
+- Events: `events.jsonl` in the state dir (`acquire`, `release`, `deny`, `timeout`, `reap`, `inherit`, `gate_bypass`, `lock_steal`).
+- Test hooks: `JOB_ROUTER_FAKE_NCPU`, `JOB_ROUTER_FAKE_LOAD`.
+- Library: `import { loadGateConfig, acquire } from './src/gate.mjs'`, then `const l = await acquire(loadGateConfig(), { cls: 'ocr' }); ...; l.release()`.
+
 ## Tests
-`npm test` (node:test, fake codex binary in `test/fake-codex.mjs`).
+`npm test` (node:test, fake codex binary in `test/fake-codex.mjs`; gate tests in `test/gate.test.mjs`).
 
 `bin/codex-router.mjs` is a back-compat shim that forwards to `bin/job-router.mjs`.
 
