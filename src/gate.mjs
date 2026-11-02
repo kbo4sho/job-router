@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import crypto from 'node:crypto';
+import { spawn } from 'node:child_process';
 import { expand } from './router.mjs';
 
 export const EX_TEMPFAIL = 75;
@@ -133,9 +134,54 @@ export function tryStealLock(lock, observed) {
 }
 export const releaseLock = tryStealLock;
 
+// Kernel flock via a short-lived /usr/bin/perl helper (no native deps). The helper holds LOCK_EX
+// on <stateDir>/lock.flock until killed or its stdin closes, so the kernel frees it if we die (even SIGKILL).
+// Returns { release } when held, LOCK_LOST on contention timeout, or null if the helper is unusable.
+const FLOCK_PL = 'use Fcntl qw(:flock); $|=1; open(my $f, ">>", $ARGV[0]) or exit 3; print "started\n"; flock($f, LOCK_EX) or exit 4; print "ok\n"; 1 while <STDIN>; exit 0;';
+export function flockAcquire(stateDir, budgetMs = Infinity, { perl = process.env.JOB_ROUTER_PERL || '/usr/bin/perl', startMs = 2000 } = {}) {
+  return new Promise((resolve) => {
+    let child, out = '', settled = false, timer;
+    const finish = (v) => { if (settled) return; settled = true; clearTimeout(timer); resolve(v); };
+    const kill = () => { try { child.kill('SIGKILL'); } catch {} };
+    try { child = spawn(perl, ['-e', FLOCK_PL, path.join(stateDir, 'lock.flock')], { stdio: ['pipe', 'pipe', 'ignore'] }); }
+    catch { return finish(null); }
+    child.on('error', () => finish(null));
+    child.on('exit', () => finish(null)); // exited before "ok": unusable (or lost)
+    child.stdin.on('error', () => {});
+    timer = setTimeout(() => { kill(); finish(null); }, startMs); // helper never started
+    child.stdout.on('data', (d) => {
+      out += d;
+      if (out.includes('ok\n')) {
+        child.removeAllListeners('exit');
+        child.stdout.destroy(); child.unref(); child.stdin.unref?.();
+        // Release synchronously (SIGKILL is a direct syscall; the kernel drops the flock on exit),
+        // so it works even if our event loop is about to block (spawnSync) or exit.
+        finish({ release: () => { try { child.kill('SIGKILL'); } catch {} try { child.stdin.destroy(); } catch {} } });
+      } else if (out.includes('started\n') && !timer._contention) {
+        clearTimeout(timer);
+        timer = setTimeout(() => { kill(); finish(LOCK_LOST); }, Math.max(10, Math.min(budgetMs, 2 ** 31 - 1)));
+        timer._contention = true;
+      }
+    });
+  });
+}
+
+// Lock = flock (outer, primary) + the mkdir lock (inner). Flock holders are serialized by the kernel,
+// so the mkdir steal/put-back logic only races among fallback users (helper missing/failing).
+// The mkdir lock is still taken under flock so fallback users stay mutually excluded with flock users.
+export async function withLock(stateDir, staleLockMs, fn, budgetMs = Infinity) {
+  fs.mkdirSync(stateDir, { recursive: true });
+  const t0 = Date.now();
+  const fl = await flockAcquire(stateDir, budgetMs);
+  if (fl === LOCK_LOST) return LOCK_LOST;
+  if (!fl) logEvent(stateDir, { event: 'lock_fallback', reason: 'flock helper unavailable' });
+  try { return await mkdirLock(stateDir, staleLockMs, fn, budgetMs - (Date.now() - t0)); }
+  finally { fl?.release(); }
+}
+
 // Atomic mkdir mutex. fn receives owns(): true while lock.d is still ours (inode + nonce).
 // budgetMs caps the wait; on deadline returns LOCK_LOST so callers apply their own timeout.
-export async function withLock(stateDir, staleLockMs, fn, budgetMs = Infinity) {
+async function mkdirLock(stateDir, staleLockMs, fn, budgetMs = Infinity) {
   const lock = path.join(stateDir, 'lock.d');
   fs.mkdirSync(stateDir, { recursive: true });
   const deadline = Date.now() + Math.min(Math.max(staleLockMs * 3, 5000), budgetMs);

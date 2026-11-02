@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { logEvent, acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, isStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
+import { LOCK_LOST, flockAcquire, logEvent, acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, isStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bin = path.join(here, '..', 'bin', 'job-router.mjs');
@@ -464,4 +464,44 @@ test('deny is logged once per reason category, not per load change', async () =>
   await assert.rejects(acquire(cfg(), { cls: 'build', env, maxWaitMs: 200, sample: () => ({ load1: (load += 0.37), ncpu: 14 }) }),
     (e) => e.exitCode === EX_TEMPFAIL);
   assert.equal(events().filter((e) => e.event === 'deny').length, 1);
+});
+
+const flockBusy = (file) => spawnSync('/usr/bin/perl', ['-e', 'use Fcntl qw(:flock); open(my $f, ">>", $ARGV[0]) or exit 3; exit(flock($f, LOCK_EX|LOCK_NB) ? 0 : 1)', file]).status === 1;
+
+test('lock is taken via the perl flock helper', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jrg-fl-'));
+  const busy = await withLock(dir, 10000, () => flockBusy(path.join(dir, 'lock.flock')));
+  assert.equal(busy, true);
+  await new Promise((r) => setTimeout(r, 200)); // helper exits after stdin closes
+  assert.equal(flockBusy(path.join(dir, 'lock.flock')), false);
+  const ev = path.join(dir, 'events.jsonl');
+  assert.ok(!fs.existsSync(ev) || !fs.readFileSync(ev, 'utf8').includes('lock_fallback'));
+});
+
+test('SIGKILLed lock holder: flock is released and the next acquirer gets the lock', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jrg-fk-'));
+  const held = path.join(dir, 'held');
+  const gate = new URL('../src/gate.mjs', import.meta.url).href;
+  const holder = spawn(process.execPath, ['--input-type=module', '-e',
+    `import { withLock } from ${JSON.stringify(gate)}; import fs from 'node:fs';
+     await withLock(${JSON.stringify(dir)}, 10000, () => { fs.writeFileSync(${JSON.stringify(held)}, 'x'); Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 30000); });`], { stdio: 'ignore' });
+  for (const t1 = Date.now(); !fs.existsSync(held) && Date.now() - t1 < 5000;) await new Promise((r) => setTimeout(r, 25));
+  assert.ok(fs.existsSync(held));
+  assert.equal(await withLock(dir, 10000, () => 'nope', 300), LOCK_LOST); // held: we time out
+  holder.kill('SIGKILL');
+  await new Promise((r) => holder.on('exit', r));
+  const t2 = Date.now();
+  assert.equal(await withLock(dir, 10000, (owns) => owns(), 5000), true);
+  assert.ok(Date.now() - t2 < 3000);
+});
+
+test('missing perl falls back to the mkdir lock', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jrg-fb-'));
+  assert.equal(await flockAcquire(dir, 1000, { perl: path.join(dir, 'no-perl') }), null);
+  const prev = process.env.JOB_ROUTER_PERL;
+  process.env.JOB_ROUTER_PERL = path.join(dir, 'no-perl');
+  try { assert.equal(await withLock(dir, 10000, (owns) => owns()), true); }
+  finally { if (prev === undefined) delete process.env.JOB_ROUTER_PERL; else process.env.JOB_ROUTER_PERL = prev; }
+  assert.ok(fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8').includes('lock_fallback'));
+  assert.ok(!fs.existsSync(path.join(dir, 'lock.d')));
 });
