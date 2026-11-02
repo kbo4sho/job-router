@@ -66,7 +66,7 @@ async function gated(cls, cmdline) {
 const WATCHDOG_JS = `const [pg, grace] = [Number(process.argv[1]), Number(process.argv[2])]; let buf = '';
 process.stdin.on('data', (d) => { buf += d; }); process.stdin.on('error', () => {});
 process.stdin.on('end', () => {
-  if (buf.includes('done')) process.exit(0);
+  if (buf.trim() === 'done') process.exit(0);
   const up = () => { try { process.kill(-pg, 0); return true; } catch { return false; } };
   if (!up()) process.exit(0);
   try { process.kill(-pg, 'SIGTERM'); } catch {}
@@ -80,7 +80,8 @@ function startWatchdog(pgid, tag) {
       { stdio: ['pipe', 'ignore', 'ignore'], detached: true });
     w.on('error', () => {}); w.stdin.on('error', () => {});
     w.unref();
-    return { stop: () => { try { w.stdin.end('done\n'); } catch {} } };
+    // Resolves once "done" is flushed to the pipe (or after 1 s), so process.exit can't drop it.
+    return { stop: () => new Promise((r) => { setTimeout(r, 1000).unref(); try { w.stdin.end('done\n', r); } catch { r(); } }) };
   } catch { return null; }
 }
 
@@ -93,7 +94,7 @@ function runChild(bin, args, env, onSpawn = () => {}) {
       const h = () => { try { process.kill(-child.pid, s); } catch { try { child.kill(s); } catch {} } };
       process.on(s, h); return [s, h];
     });
-    const done = (code) => { for (const [s, h] of fwd) process.off(s, h); dog?.stop(); resolve(code); };
+    const done = (code) => { for (const [s, h] of fwd) process.off(s, h); Promise.resolve(dog?.stop()).then(() => resolve(code)); };
     child.on('error', (e) => { console.error(`job-router: cannot run ${bin}: ${e.message}`); done(127); });
     child.on('exit', (code, sig) => done(code ?? 128 + (os.constants.signals[sig] || 0)));
   });

@@ -561,3 +561,16 @@ test('watchdog: SIGKILLed wrapper -> child group killed, lease reapable; normal 
   for (const t3 = Date.now(); watchdogs(id) && Date.now() - t3 < 2000;) await new Promise((r) => setTimeout(r, 50));
   assert.equal(watchdogs(id), '', 'no watchdog after a normal run');
 });
+
+test('watchdog: a normal exit never signals the group (backgrounded sleep survives)', async () => {
+  const { dir, env, cli } = setup();
+  const bpid = path.join(dir, 'bpid');
+  const r = cli(['run', '--class', 'codex', '--', 'sh', '-c', `sleep 30 >/dev/null 2>&1 & echo $! > ${bpid}; exit 0`],
+    { JOB_ROUTER_WATCHDOG_GRACE_MS: '300' });
+  assert.equal(r.status, 0, r.stderr);
+  const b = Number(fs.readFileSync(bpid, 'utf8'));
+  await new Promise((res) => setTimeout(res, 1500));
+  let aliveNow = true; try { process.kill(b, 0); } catch { aliveNow = false; }
+  try { process.kill(b, 'SIGKILL'); } catch {}
+  assert.ok(aliveNow, 'backgrounded sleep must survive a normal exit');
+});
