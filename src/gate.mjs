@@ -80,10 +80,18 @@ export function stateDirOf(cfg, env = process.env) {
   return expand(env.JOB_ROUTER_STATE_DIR || cfg?.stateDir || defaultGateConfig().stateDir);
 }
 
+export const EVENTS_MAX_BYTES = 5 * 1024 * 1024;
+// Deny reason category: 'class' (cap), 'exclusive', 'pool', 'load'.
+export const reasonCategory = (r) => String(r).split(' ')[0];
+
 export function logEvent(stateDir, ev) {
   try {
     fs.mkdirSync(stateDir, { recursive: true });
-    fs.appendFileSync(path.join(stateDir, 'events.jsonl'), JSON.stringify({ ts: new Date().toISOString(), ...ev }) + '\n');
+    const file = path.join(stateDir, 'events.jsonl');
+    // Size-based rotation: atomic rename to events.jsonl.1 (one old generation kept).
+    const max = Number(process.env.JOB_ROUTER_EVENTS_MAX_BYTES) || EVENTS_MAX_BYTES;
+    try { if (fs.statSync(file).size >= max) fs.renameSync(file, `${file}.1`); } catch {}
+    fs.appendFileSync(file, JSON.stringify({ ts: new Date().toISOString(), ...ev }) + '\n');
   } catch {}
 }
 
@@ -251,7 +259,7 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
       }, Math.max(10, wait - (Date.now() - t0)));
       if (!reason) break;
       if (reason === LOCK_LOST) logEvent(stateDir, { event: 'lock_lost', class: cls, leaseId: id });
-      else if (reason !== lastReason) { logEvent(stateDir, { event: 'deny', class: cls, prio, leaseId: id, reason, load1: s.load1 }); lastReason = reason; }
+      else if (reasonCategory(reason) !== lastReason) { logEvent(stateDir, { event: 'deny', class: cls, prio, leaseId: id, reason, load1: s.load1 }); lastReason = reasonCategory(reason); }
       if (!waiting) {
         waiting = true;
         try { fs.mkdirSync(path.dirname(waitFile), { recursive: true }); writeAtomic(waitFile, JSON.stringify({ id, pid: process.pid, class: cls, prio, since: t0 })); } catch {}
