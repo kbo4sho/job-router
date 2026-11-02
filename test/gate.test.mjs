@@ -537,3 +537,27 @@ test('weight_clamped: timed-out run logs nothing; poolUnits override with defaul
     assert.ok(!p.events().some((e) => e.event === 'weight_clamped'), `poolUnits ${poolUnits}`);
   }
 });
+
+const watchdogs = (tag) => spawnSync('pgrep', ['-f', `job-router-watchdog:${tag}`], { encoding: 'utf8' }).stdout.trim();
+
+test('watchdog: SIGKILLed wrapper -> child group killed, lease reapable; normal run leaves no watchdog', async () => {
+  const { dir, env, cli, events } = setup();
+  const gpid = path.join(dir, 'gpid');
+  const p = spawn(process.execPath, [bin, 'run', '--class', 'codex', '--', 'sh', '-c', `sleep 30 & echo $! > ${gpid}; wait`],
+    { env: { ...env, JOB_ROUTER_WATCHDOG_GRACE_MS: '1000' }, stdio: 'ignore' });
+  for (const t0 = Date.now(); !(fs.existsSync(gpid) && fs.readFileSync(gpid, 'utf8').trim()) && Date.now() - t0 < 5000;) await new Promise((r) => setTimeout(r, 25));
+  const g = Number(fs.readFileSync(gpid, 'utf8'));
+  const lease = readLeases(env.JOB_ROUTER_STATE_DIR)[0];
+  assert.ok(watchdogs(lease.id), 'watchdog running while job runs');
+  p.kill('SIGKILL');
+  const gone = (pid) => { try { process.kill(pid, 0); return false; } catch { return true; } };
+  for (const t1 = Date.now(); !(gone(g) && gone(lease.childPid)) && Date.now() - t1 < 5000;) await new Promise((r) => setTimeout(r, 50));
+  assert.ok(gone(g), 'grandchild killed'); assert.ok(gone(lease.childPid), 'child killed');
+  assert.equal(isStale(readLeases(env.JOB_ROUTER_STATE_DIR)[0]), true);
+  for (const t2 = Date.now(); watchdogs(lease.id) && Date.now() - t2 < 3000;) await new Promise((r) => setTimeout(r, 50));
+  assert.equal(watchdogs(lease.id), '');
+  assert.equal(cli(['run', '--class', 'codex', '--', 'true']).status, 0);
+  const id = events().filter((e) => e.event === 'acquire').pop().leaseId;
+  for (const t3 = Date.now(); watchdogs(id) && Date.now() - t3 < 2000;) await new Promise((r) => setTimeout(r, 50));
+  assert.equal(watchdogs(id), '', 'no watchdog after a normal run');
+});
