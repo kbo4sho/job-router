@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, isStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
+import { logEvent, acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, isStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bin = path.join(here, '..', 'bin', 'job-router.mjs');
@@ -444,4 +444,24 @@ test('broken gate config + critical: unknown --class still exits 2, no bypass', 
   assert.equal(r.status, 2); assert.match(r.stderr, /unknown class "ocrr"/);
   assert.equal(cli(['run', '--class', 'ocr', '--prio', 'bogus', '--', 'true']).status, 2);
   assert.ok(!events().some((e) => e.event === 'gate_bypass'));
+});
+
+test('events.jsonl rotates by size, keeping one old file', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jrg-rot-'));
+  const prev = process.env.JOB_ROUTER_EVENTS_MAX_BYTES;
+  process.env.JOB_ROUTER_EVENTS_MAX_BYTES = '500';
+  try { for (let k = 0; k < 60; k++) logEvent(dir, { event: 'x', k, pad: 'p'.repeat(40) }); }
+  finally { if (prev === undefined) delete process.env.JOB_ROUTER_EVENTS_MAX_BYTES; else process.env.JOB_ROUTER_EVENTS_MAX_BYTES = prev; }
+  assert.deepEqual(fs.readdirSync(dir).sort(), ['events.jsonl', 'events.jsonl.1']);
+  assert.ok(fs.statSync(path.join(dir, 'events.jsonl')).size < 600);
+  const last = fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8').trim().split('\n').pop();
+  assert.equal(JSON.parse(last).k, 59);
+});
+
+test('deny is logged once per reason category, not per load change', async () => {
+  const { cfg, env, events } = setup();
+  let load = 20;
+  await assert.rejects(acquire(cfg(), { cls: 'build', env, maxWaitMs: 200, sample: () => ({ load1: (load += 0.37), ncpu: 14 }) }),
+    (e) => e.exitCode === EX_TEMPFAIL);
+  assert.equal(events().filter((e) => e.event === 'deny').length, 1);
 });
