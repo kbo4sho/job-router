@@ -176,7 +176,7 @@ export function decide(cfg, leases, { cls, prio, load1, ncpu }) {
   const inClass = leases.filter((l) => l.class === cls).length;
   if (!critical && inClass >= c.cap) return `class cap ${cls} ${inClass}/${c.cap}`;
   for (const grp of cfg.exclusive || []) {
-    if (grp.includes(cls) && leases.some((l) => l.class !== cls && grp.includes(l.class))) return `exclusive with ${grp.join('/')}`;
+    if (grp.includes(cls) && leases.some((l) => grp.includes(l.class))) return `exclusive with ${grp.join('/')}`;
   }
   const limit = critical ? cfg.poolUnits : cfg.poolUnits - (cfg.reserveCritical || 0);
   if (used + c.weight > Math.max(limit, critical ? 1 : 0)) return `pool ${used}+${c.weight}>${limit}`;
@@ -191,7 +191,11 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
   // Inherit a lease of the same class or the same exclusive group (imagegen/ollama); others go through normal admission.
   const parentCls = env.JOB_ROUTER_LEASE?.split('.')[0];
   const related = parentCls && (parentCls === cls || (cfg.exclusive || []).some((g) => g.includes(cls) && g.includes(parentCls)));
-  if (related) {
+  const parentFile = related && path.join(stateDir, 'leases', `${path.basename(env.JOB_ROUTER_LEASE)}.json`);
+  let parentLive = false;
+  if (related) { try { parentLive = !isStale(JSON.parse(fs.readFileSync(parentFile, 'utf8'))); } catch {} }
+  if (related && !parentLive) logEvent(stateDir, { event: 'inherit_dangling', class: cls, leaseId: env.JOB_ROUTER_LEASE });
+  if (related && parentLive) {
     logEvent(stateDir, { event: 'inherit', class: cls, leaseId: env.JOB_ROUTER_LEASE, pid: process.pid });
     return { id: env.JOB_ROUTER_LEASE, inherited: true, release() {}, setChildPid() {} };
   }

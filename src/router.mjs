@@ -135,13 +135,14 @@ export function classify(cfg, output, code) {
 }
 
 // Spawn with closed stdin in its own process group; hard timeout kills the group.
-export function runWithTimeout(bin, args, timeoutMs, graceMs = 5000) {
+export function runWithTimeout(bin, args, timeoutMs, graceMs = 5000, onSpawn) {
   return new Promise((resolve) => {
     let out = '', err = '', timedOut = false, done = false;
     let child;
     try {
       child = spawn(bin, args, { stdio: ['ignore', 'pipe', 'pipe'], detached: true });
     } catch (e) { return resolve({ code: 127, out, err: String(e), timedOut }); }
+    if (onSpawn && child.pid) onSpawn(child.pid);
     const killGroup = (sig) => { try { process.kill(-child.pid, sig); } catch { try { child.kill(sig); } catch {} } };
     const t = setTimeout(() => {
       timedOut = true; killGroup('SIGTERM');
@@ -179,7 +180,7 @@ export function which(cfg, jobType) {
   return { jobType: jt, tier, model: null, skipped };
 }
 
-export async function route(cfg, { jobType, codexArgs = [], probe = false, log = makeLogger(cfg) }) {
+export async function route(cfg, { jobType, codexArgs = [], probe = false, log = makeLogger(cfg), onSpawn }) {
   const { tier, ladder, jobType: jt } = resolveTier(cfg, jobType);
   const attempts = [];
   const fall = (a) => { attempts.push(a); log({ event: 'fallback', jobType: jt, tier, ...a }); };
@@ -197,12 +198,12 @@ export async function route(cfg, { jobType, codexArgs = [], probe = false, log =
     const bucketWhy = e.bucket ? bucketExhausted(readBuckets(cfg)[e.bucket]) : null;
     if (bucketWhy) { fall({ model: e.model, reason: 'bucket_exhausted', detail: `${e.bucket}: ${bucketWhy}` }); continue; }
     if (probe) {
-      const p = await runWithTimeout(expand(cfg.codexBin), ['exec', '--skip-git-repo-check', '-m', e.model, 'Reply with OK.'], cfg.probeTimeoutMs, cfg.killGraceMs);
+      const p = await runWithTimeout(expand(cfg.codexBin), ['exec', '--skip-git-repo-check', '-m', e.model, 'Reply with OK.'], cfg.probeTimeoutMs, cfg.killGraceMs, onSpawn);
       const why = p.timedOut ? 'probe_timeout' : classify(cfg, p.out + p.err, p.code) || (p.code !== 0 ? 'probe_failed' : null);
       if (why) { fall({ model: e.model, reason: why, exit: p.code }); continue; }
     }
     log({ event: 'attempt', jobType: jt, tier, model: e.model });
-    const r = await runWithTimeout(expand(cfg.codexBin), ['exec', '-m', e.model, ...codexArgs], cfg.runTimeoutMs, cfg.killGraceMs);
+    const r = await runWithTimeout(expand(cfg.codexBin), ['exec', '-m', e.model, ...codexArgs], cfg.runTimeoutMs, cfg.killGraceMs, onSpawn);
     if (r.timedOut) {
       fall({ model: e.model, reason: 'timeout', timeoutMs: cfg.runTimeoutMs });
       if (cfg.fallbackOnTimeout) continue;

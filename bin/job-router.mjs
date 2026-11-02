@@ -88,8 +88,15 @@ try {
     if (!opts.rest.length) throw new RouterError('run needs codex exec args after --', 2);
     const lease = await gated('codex', ['codex', ...opts.rest]);
     Object.assign(process.env, lease.env); // nested job-router calls inherit the lease
+    let childPid = null;
+    for (const sig of ['SIGINT', 'SIGTERM', 'SIGHUP']) process.on(sig, () => {
+      if (childPid) { try { process.kill(-childPid, 'SIGTERM'); } catch {} }
+      lease.release({ signal: sig });
+      process.exit(128 + os.constants.signals[sig]);
+    });
     try {
-      const r = await route(cfg, { jobType: opts.job, codexArgs: opts.rest, probe: opts.probe });
+      const r = await route(cfg, { jobType: opts.job, codexArgs: opts.rest, probe: opts.probe,
+        onSpawn: (pid) => { childPid = pid; lease.setChildPid(pid); } });
       for (const a of r.attempts) console.error(`job-router: fell back from ${a.model} (${a.reason})`);
       console.error(`job-router: used ${r.model} (tier ${r.tier})`);
       process.stdout.write(r.out); process.stderr.write(r.err);

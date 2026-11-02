@@ -30,6 +30,7 @@ test('defaults derive from cpu count (14 cpu)', () => {
   assert.equal(d.poolUnits, 12);
   assert.deepEqual(Object.fromEntries(Object.entries(d.classes).map(([k, c]) => [k, c.cap])),
     { ocr: 4, pdf: 3, build: 1, codex: 3, imagegen: 1, ollama: 1 });
+  assert.equal(d.reserveCritical, 3); assert.equal(d.classes.build.weight, 6);
 });
 
 test('class cap is enforced', async () => {
@@ -225,4 +226,43 @@ test('nested ollama under an imagegen lease inherits it (same exclusive group)',
     process.execPath, '-e', 'process.exit(0)']);
   assert.equal(r.status, 0, r.stderr);
   assert.ok(events().some((e) => e.event === 'inherit' && e.class === 'ollama' && /^imagegen\./.test(e.leaseId)));
+});
+
+test('GPU group blocks a second critical of the same class', async () => {
+  const { acq } = setup();
+  const i = await acq('imagegen');
+  await assert.rejects(acq('imagegen', { prio: 'critical', maxWaitMs: 50 }), (e) => e.exitCode === EX_TEMPFAIL);
+  await assert.rejects(acq('ollama', { prio: 'critical', maxWaitMs: 50 }), (e) => e.exitCode === EX_TEMPFAIL);
+  i.release();
+});
+
+test('dangling JOB_ROUTER_LEASE is not inherited; normal admission applies', async () => {
+  const { acq, env } = setup();
+  const held = await acq('build');
+  const e2 = { ...env, JOB_ROUTER_LEASE: 'build.999999.deadbeef' };
+  await assert.rejects(acq('build', { env: e2, maxWaitMs: 50 }), (e) => e.exitCode === EX_TEMPFAIL);
+  held.release();
+  const l = await acq('build', { env: e2 });
+  assert.equal(l.inherited, false); l.release();
+});
+
+test('run --job: signal kills codex child group, releases lease, child pid recorded', async () => {
+  const { dir, env, events } = setup();
+  const fake = path.join(dir, 'codex.mjs'), pidFile = path.join(dir, 'cpid');
+  fs.writeFileSync(fake, `#!/usr/bin/env node\nrequire('fs').writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(()=>{},1000);\n`.replace('require', "(await import('node:module')).createRequire(import.meta.url)"), { mode: 0o755 });
+  const cfgFile = path.join(dir, 'router.json');
+  fs.writeFileSync(cfgFile, JSON.stringify({ codexBin: fake, sessionsDir: path.join(dir, 'ns'), logFile: path.join(dir, 'log.jsonl'), tiers: { normal: ['M1'] } }));
+  const p = spawn(process.execPath, [bin, 'run', '--config', cfgFile, '--', 'hi'], { env, stdio: 'ignore' });
+  const t0 = Date.now();
+  while (!fs.existsSync(pidFile) && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 25));
+  const cpid = Number(fs.readFileSync(pidFile, 'utf8'));
+  const lease = readLeases(env.JOB_ROUTER_STATE_DIR)[0];
+  assert.equal(lease.childPid, cpid);
+  const exited = new Promise((r) => p.on('exit', (code) => r(code)));
+  p.kill('SIGTERM');
+  assert.equal(await exited, 143);
+  await new Promise((r) => setTimeout(r, 100));
+  assert.throws(() => process.kill(cpid, 0));
+  assert.deepEqual(readLeases(env.JOB_ROUTER_STATE_DIR), []);
+  assert.ok(events().some((e) => e.event === 'release' && e.signal === 'SIGTERM'));
 });
