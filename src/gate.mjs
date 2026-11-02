@@ -75,10 +75,16 @@ export function loadGateConfig(file = defaultGateConfigPath(), env = process.env
   if (env.JOB_ROUTER_STATE_DIR) cfg.stateDir = env.JOB_ROUTER_STATE_DIR;
   const maxW = Math.max(1, cfg.poolUnits - (cfg.reserveCritical || 0));
   const clamped = [];
-  const nominal = nominalWeights(hostNcpu(env));
+  // Expected default weight for the *effective* pool with the default reserve; only a loader
+  // re-clamp below that is reported (so a poolUnits override alone logs nothing).
+  const effPool = cfg.poolUnits >= 1 ? cfg.poolUnits : 1;
+  const effMax = Math.max(1, effPool - Math.max(1, Math.floor(effPool / 4)));
+  const nominal = Object.fromEntries(Object.entries(nominalWeights(effPool + 2)).map(([k, v]) => [k, Math.max(1, Math.min(effMax, v))]));
   for (const [k, c] of Object.entries(cfg.classes)) {
-    if (!(raw.classes?.[k]?.weight >= 0) && c.weight > maxW) c.weight = maxW; // re-clamp defaults
-    if (!(raw.classes?.[k]?.weight >= 0) && nominal[k] > c.weight) clamped.push({ class: k, from: nominal[k], to: c.weight });
+    if (!(raw.classes?.[k]?.weight >= 0) && c.weight > maxW) {
+      c.weight = maxW; // re-clamp defaults
+      if (nominal[k] > maxW) clamped.push({ class: k, from: nominal[k], to: maxW });
+    }
     if (c.weight > maxW) throw new GateError(`gate config: class ${k} weight ${c.weight} > poolUnits-reserveCritical (${maxW}); it could never be admitted`);
     if (!(c.cap >= 1) || !(c.weight >= 1)) throw new GateError(`gate config: class ${k} needs cap>=1 and weight>=1`);
   }
@@ -250,7 +256,6 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
   }
   const c = cfg.classes[cls];
   if (!c) throw new GateError(`unknown class "${cls}" (known: ${Object.keys(cfg.classes).join(', ')})`);
-  for (const c of cfg.clamped || []) logEvent(stateDir, { event: 'weight_clamped', ...c });
   const id = `${cls}.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
   const leaseFile = path.join(stateDir, 'leases', `${id}.json`);
   const waitFile = path.join(stateDir, 'waiters', `${id}.json`);
@@ -268,6 +273,7 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
           if (!commitLease(owns, leaseFile, { id, pid: process.pid, class: cls, weight: c.weight, prio, startedAt: Date.now(), cmd })) return LOCK_LOST;
           const used = leases.reduce((a, l) => a + l.weight, 0) + c.weight;
           logEvent(stateDir, { event: 'acquire', class: cls, prio, leaseId: id, pid: process.pid, waitMs: Date.now() - t0, used, pool: cfg.poolUnits, load1: s.load1, ncpu: s.ncpu });
+          for (const w of (cfg.clamped || []).filter((x) => x.class === cls)) logEvent(stateDir, { event: 'weight_clamped', leaseId: id, ...w });
         }
         return why;
       }, Math.max(10, wait - (Date.now() - t0)));
