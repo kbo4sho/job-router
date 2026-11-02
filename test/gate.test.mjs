@@ -505,3 +505,35 @@ test('missing perl falls back to the mkdir lock', async () => {
   assert.ok(fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8').includes('lock_fallback'));
   assert.ok(!fs.existsSync(path.join(dir, 'lock.d')));
 });
+
+test('weight_clamped: logged after a successful acquire of the clamped class only; status read-only', async () => {
+  const big = setup();                       // 14 cpu: nothing clamped
+  (await big.acq('build')).release();
+  assert.ok(!big.events().some((e) => e.event === 'weight_clamped'));
+  const t = setup({ gate: { reserveCritical: 8 } }); // pool 12, max weight 4 -> build 6 clamped
+  t.cfg();
+  assert.equal(t.cli(['status', '--json']).status, 0);
+  assert.deepEqual(t.events(), []);                  // read-only
+  assert.equal(t.cli(['run', '--class', 'codex', '--', 'true']).status, 0);
+  assert.ok(!t.events().some((e) => e.event === 'weight_clamped')); // other class: no build clamp
+  (await t.acq('build')).release();
+  const ev = t.events().filter((e) => e.event === 'weight_clamped');
+  assert.deepEqual(ev.map((e) => [e.class, e.from, e.to]), [['build', 6, 4]]);
+  const user = setup({ gate: { reserveCritical: 8, classes: { build: { weight: 3 } } } }); // explicit weight: no event
+  (await user.acq('build')).release();
+  assert.ok(!user.events().some((e) => e.event === 'weight_clamped'));
+});
+
+test('weight_clamped: timed-out run logs nothing; poolUnits override with default reserve logs nothing', async () => {
+  const t = setup({ gate: { reserveCritical: 8 } });
+  const held = await t.acq('build');
+  const r = t.cli(['run', '--class', 'build', '--max-wait', '100', '--', 'true']);
+  held.release();
+  assert.equal(r.status, 75);
+  assert.equal(t.events().filter((e) => e.event === 'weight_clamped').length, 1); // only the holder's acquire
+  for (const poolUnits of [8, 20]) {
+    const p = setup({ gate: { poolUnits } });
+    (await p.acq('build')).release();
+    assert.ok(!p.events().some((e) => e.event === 'weight_clamped'), `poolUnits ${poolUnits}`);
+  }
+});
