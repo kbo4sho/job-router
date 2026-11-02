@@ -1,4 +1,4 @@
-import { test } from 'node:test';
+import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
@@ -321,4 +321,54 @@ test('reserveCritical outside [0, poolUnits) is invalid config (exit 2)', () => 
     assert.equal(bad.cli(['run', '--class', 'codex', '--', 'true']).status, 2);
   }
   assert.doesNotThrow(() => setup({ gate: { reserveCritical: 0 } }).cfg());
+});
+
+test('owner-file write failure drops lock.d and retries, never a silent hold', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jrg-ow-'));
+  let fails = 2;
+  const orig = fs.writeFileSync;
+  const m = mock.method(fs, 'writeFileSync', function (f, ...a) {
+    if (String(f).includes(`lock.d${path.sep}owner`) && fails > 0) { fails--; throw new Error('ENOSPC fake'); }
+    return orig.call(fs, f, ...a);
+  });
+  try {
+    const owned = await withLock(dir, 10000, (owns) => owns());
+    assert.equal(owned, true); assert.equal(fails, 0);
+  } finally { m.mock.restore(); }
+  assert.ok(!fs.existsSync(path.join(dir, 'lock.d')));
+  assert.ok(fs.readFileSync(path.join(dir, 'events.jsonl'), 'utf8').includes('lock_owner_write_failed'));
+});
+
+test('persistent lock loss still honours the wait timeout (75)', async () => {
+  const { acq } = setup();
+  const orig = fs.readFileSync;
+  const m = mock.method(fs, 'readFileSync', function (f, ...a) {
+    if (String(f).endsWith(`lock.d${path.sep}owner`)) return 'foreign.nonce';
+    return orig.call(fs, f, ...a);
+  });
+  try { await assert.rejects(acq('codex', { maxWaitMs: 150 }), (e) => e.exitCode === EX_TEMPFAIL && /lock lost/.test(e.message)); }
+  finally { m.mock.restore(); }
+});
+
+test('run --class: SIGTERM kills the whole child process group and releases the lease', async () => {
+  const { dir, env, events } = setup();
+  const gpid = path.join(dir, 'gpid');
+  const p = spawn(process.execPath, [bin, 'run', '--class', 'codex', '--', 'sh', '-c', `sleep 30 & echo $! > ${gpid}; wait`], { env, stdio: 'ignore' });
+  const t0 = Date.now();
+  while (!(fs.existsSync(gpid) && fs.readFileSync(gpid, 'utf8').trim()) && Date.now() - t0 < 5000) await new Promise((r) => setTimeout(r, 25));
+  const g = Number(fs.readFileSync(gpid, 'utf8'));
+  const exited = new Promise((r) => p.on('exit', (code) => r(code)));
+  p.kill('SIGTERM');
+  assert.equal(await exited, 143);
+  await new Promise((r) => setTimeout(r, 150));
+  assert.throws(() => process.kill(g, 0), 'grandchild should be gone');
+  assert.deepEqual(readLeases(env.JOB_ROUTER_STATE_DIR), []);
+  assert.ok(events().some((e) => e.event === 'release' && e.class === 'codex'));
+});
+
+test('--prio accepts only normal or critical', () => {
+  const { cli } = setup();
+  const r = cli(['run', '--class', 'codex', '--prio', 'high', '--', 'true']);
+  assert.equal(r.status, 2); assert.match(r.stderr, /--prio must be normal or critical/);
+  assert.equal(cli(['run', '--class', 'codex', '--prio', 'normal', '--', 'true']).status, 0);
 });

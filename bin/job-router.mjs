@@ -33,6 +33,7 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--probe') opts.probe = true;
   else { opts.rest = argv.slice(i); break; }
 }
+if (!['normal', 'critical'].includes(opts.prio)) { console.error(`job-router: FAIL: --prio must be normal or critical (got "${opts.prio}")`); process.exit(2); }
 const critical = opts.prio === 'critical';
 
 // Load gate config; on failure critical runs ungated (logged), everything else fails closed.
@@ -53,9 +54,12 @@ async function gated(cls, cmdline) {
 
 function runChild(bin, args, env, onSpawn = () => {}) {
   return new Promise((resolve) => {
-    const child = spawn(bin, args, { stdio: 'inherit', env });
+    const child = spawn(bin, args, { stdio: 'inherit', env, detached: true }); // own process group
     if (child.pid) onSpawn(child.pid);
-    const fwd = ['SIGINT', 'SIGTERM', 'SIGHUP'].map((s) => { const h = () => { try { child.kill(s); } catch {} }; process.on(s, h); return [s, h]; });
+    const fwd = ['SIGINT', 'SIGTERM', 'SIGHUP'].map((s) => {
+      const h = () => { try { process.kill(-child.pid, s); } catch { try { child.kill(s); } catch {} } };
+      process.on(s, h); return [s, h];
+    });
     const done = (code) => { for (const [s, h] of fwd) process.off(s, h); resolve(code); };
     child.on('error', (e) => { console.error(`job-router: cannot run ${bin}: ${e.message}`); done(127); });
     child.on('exit', (code, sig) => done(code ?? 128 + (os.constants.signals[sig] || 0)));

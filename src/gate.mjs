@@ -134,7 +134,15 @@ export async function withLock(stateDir, staleLockMs, fn) {
     try {
       fs.mkdirSync(lock);
       me = { ino: inoOf(lock), owner: `${process.pid}.${crypto.randomBytes(6).toString('hex')}` };
-      try { writeAtomic(path.join(lock, 'owner'), me.owner); } catch {}
+      try { writeAtomic(path.join(lock, 'owner'), me.owner); }
+      catch (we) {
+        // No owner file = not a valid hold. Drop it and retry like contention.
+        try { fs.rmSync(lock, { recursive: true, force: true }); } catch {}
+        logEvent(stateDir, { event: 'lock_owner_write_failed', error: we.message });
+        if (Date.now() > deadline) throw new GateError(`gate lock ${lock}: cannot write owner (${we.message})`);
+        await sleep(20 + Math.random() * 30);
+        continue;
+      }
       break;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
@@ -238,15 +246,15 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
         return why;
       });
       if (!reason) break;
-      if (reason === LOCK_LOST) { logEvent(stateDir, { event: 'lock_lost', class: cls, leaseId: id }); continue; }
-      if (reason !== lastReason) { logEvent(stateDir, { event: 'deny', class: cls, prio, leaseId: id, reason, load1: s.load1 }); lastReason = reason; }
+      if (reason === LOCK_LOST) logEvent(stateDir, { event: 'lock_lost', class: cls, leaseId: id });
+      else if (reason !== lastReason) { logEvent(stateDir, { event: 'deny', class: cls, prio, leaseId: id, reason, load1: s.load1 }); lastReason = reason; }
       if (!waiting) {
         waiting = true;
         try { fs.mkdirSync(path.dirname(waitFile), { recursive: true }); writeAtomic(waitFile, JSON.stringify({ id, pid: process.pid, class: cls, prio, since: t0 })); } catch {}
       }
       if (Date.now() - t0 >= wait) {
-        logEvent(stateDir, { event: 'timeout', class: cls, prio, leaseId: id, waitMs: Date.now() - t0, reason });
-        throw new GateError(`queue timeout after ${Date.now() - t0}ms for class ${cls} (${reason})`, EX_TEMPFAIL);
+        logEvent(stateDir, { event: 'timeout', class: cls, prio, leaseId: id, waitMs: Date.now() - t0, reason: reason === LOCK_LOST ? 'lock lost' : reason });
+        throw new GateError(`queue timeout after ${Date.now() - t0}ms for class ${cls} (${reason === LOCK_LOST ? 'lock lost' : reason})`, EX_TEMPFAIL);
       }
       await sleep(Math.min(cfg.pollMs * (0.75 + Math.random() * 0.5), Math.max(10, wait - (Date.now() - t0))));
     }
