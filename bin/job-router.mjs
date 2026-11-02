@@ -86,12 +86,12 @@ function startWatchdog(pgid, tag) {
   } catch { return null; }
 }
 
-function runChild(bin, args, env, onSpawn = () => {}) {
+function runChild(bin, args, env, onSpawn = () => {}, leaseId = null) {
   return new Promise((resolve) => {
     const child = spawn(bin, args, { stdio: 'inherit', env, detached: true }); // own process group
     if (child.pid) onSpawn(child.pid);
-    // Only when a lease is held; ungated paths (legacy run, critical bypass) spawn nothing extra.
-    const dog = child.pid && env.JOB_ROUTER_LEASE ? startWatchdog(child.pid, env.JOB_ROUTER_LEASE) : null;
+    // Only when this invocation holds (or inherited) a lease; ungated paths spawn nothing extra.
+    const dog = child.pid && leaseId ? startWatchdog(child.pid, leaseId) : null;
     const fwd = ['SIGINT', 'SIGTERM', 'SIGHUP'].map((s) => {
       const h = () => { try { process.kill(-child.pid, s); } catch { try { child.kill(s); } catch {} } };
       process.on(s, h); return [s, h];
@@ -124,7 +124,8 @@ try {
   } else if (opts.cls) {
     if (!opts.rest.length) throw new GateError('run --class needs a command after --', 2);
     const lease = await gated(opts.cls, opts.rest);
-    const code = await runChild(opts.rest[0], opts.rest.slice(1), { ...process.env, ...lease.env }, (pid) => lease.setChildPid(pid));
+    const code = await runChild(opts.rest[0], opts.rest.slice(1), { ...process.env, ...lease.env }, (pid) => lease.setChildPid(pid),
+      lease.env?.JOB_ROUTER_LEASE ?? (lease.inherited ? lease.id : null));
     lease.release({ exit: code });
     process.exit(code);
   } else {

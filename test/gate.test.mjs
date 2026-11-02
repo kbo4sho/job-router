@@ -588,6 +588,9 @@ test('ungated paths spawn no watchdog (legacy run, critical bypass)', () => {
   assert.equal(legacy.status, 0, legacy.stderr); assert.match(legacy.stdout, /nodog/);
   const bypass = cli(['run', '--class', 'codex', '--prio', 'critical', '--', probe]);
   assert.equal(bypass.status, 0, bypass.stderr); assert.equal(bypass.stdout.trim(), 'nodog');
+  // nested critical bypass with an inherited (parent's) JOB_ROUTER_LEASE in its env: still none
+  const nested = cli(['run', '--class', 'codex', '--prio', 'critical', '--', probe], { JOB_ROUTER_LEASE: 'build.12345.cafebabe' });
+  assert.equal(nested.status, 0, nested.stderr); assert.equal(nested.stdout.trim(), 'nodog');
   const gated = setup().cli(['run', '--class', 'codex', '--', probe]);
   assert.equal(gated.stdout.trim(), 'dog'); // sanity: gated run does start one
 });
