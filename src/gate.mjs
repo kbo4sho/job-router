@@ -24,11 +24,18 @@ export function hostLoad1(env = process.env) {
   return l !== undefined && l !== '' && Number.isFinite(Number(l)) ? Number(l) : os.loadavg()[0];
 }
 
+// Default weights before any clamp to poolUnits - reserveCritical.
+export function nominalWeights(ncpu = hostNcpu()) {
+  const pool = Math.max(1, ncpu - 2);
+  return { ocr: 1, pdf: 1, build: Math.max(1, Math.floor(pool / 2)), codex: 1, imagegen: 4, ollama: 4 };
+}
+
 export function defaultGateConfig(ncpu = hostNcpu()) {
   const pool = Math.max(1, ncpu - 2);
   const reserve = Math.max(1, Math.floor(pool / 4));
   const maxW = Math.max(1, pool - reserve); // heaviest weight a normal-priority job can be admitted with
   const w = (n) => Math.max(1, Math.min(maxW, n));
+  const nom = nominalWeights(ncpu);
   return {
     stateDir: '~/.local/state/job-router/gate',
     poolUnits: pool,
@@ -41,10 +48,10 @@ export function defaultGateConfig(ncpu = hostNcpu()) {
     classes: {
       ocr: { cap: Math.max(1, Math.floor(pool / 3)), weight: 1, heavy: true, env: { OMP_THREAD_LIMIT: '1' } },
       pdf: { cap: Math.max(1, Math.floor(pool / 4)), weight: 1, heavy: true },
-      build: { cap: 1, weight: w(Math.floor(pool / 2)), heavy: true },
+      build: { cap: 1, weight: w(nom.build), heavy: true },
       codex: { cap: 3, weight: 1, heavy: false },
-      imagegen: { cap: 1, weight: w(4), heavy: true },
-      ollama: { cap: 1, weight: w(4), heavy: true },
+      imagegen: { cap: 1, weight: w(nom.imagegen), heavy: true },
+      ollama: { cap: 1, weight: w(nom.ollama), heavy: true },
     },
   };
 }
@@ -66,13 +73,17 @@ export function loadGateConfig(file = defaultGateConfigPath(), env = process.env
   for (const [k, v] of Object.entries(raw.classes || {})) cfg.classes[k] = { ...(base.classes[k] || { cap: 1, weight: 1, heavy: true }), ...v };
   if (env.JOB_ROUTER_STATE_DIR) cfg.stateDir = env.JOB_ROUTER_STATE_DIR;
   const maxW = Math.max(1, cfg.poolUnits - (cfg.reserveCritical || 0));
+  const clamped = [];
+  const nominal = nominalWeights(hostNcpu(env));
   for (const [k, c] of Object.entries(cfg.classes)) {
     if (!(raw.classes?.[k]?.weight >= 0) && c.weight > maxW) c.weight = maxW; // re-clamp defaults
+    if (!(raw.classes?.[k]?.weight >= 0) && nominal[k] > c.weight) clamped.push({ class: k, from: nominal[k], to: c.weight });
     if (c.weight > maxW) throw new GateError(`gate config: class ${k} weight ${c.weight} > poolUnits-reserveCritical (${maxW}); it could never be admitted`);
     if (!(c.cap >= 1) || !(c.weight >= 1)) throw new GateError(`gate config: class ${k} needs cap>=1 and weight>=1`);
   }
   if (!(cfg.poolUnits >= 1)) throw new GateError('gate config: poolUnits must be >= 1');
   if (!(cfg.reserveCritical >= 0 && cfg.reserveCritical < cfg.poolUnits)) throw new GateError(`gate config: reserveCritical must be >= 0 and < poolUnits (${cfg.poolUnits})`);
+  for (const c of clamped) logEvent(stateDirOf(cfg, env), { event: 'weight_clamped', ...c, maxWeight: maxW });
   return cfg;
 }
 
