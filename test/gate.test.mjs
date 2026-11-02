@@ -90,6 +90,17 @@ test('critical bypasses the load check and the reserve holds for it', async () =
   const hot = await acq('build', { prio: 'critical' }); hot.release();
 });
 
+test('critical skips the class cap but respects GPU exclusivity', async () => {
+  const { acq } = setup();
+  const b = await acq('build');
+  await assert.rejects(acq('build'), (e) => e.exitCode === EX_TEMPFAIL);
+  const b2 = await acq('build', { prio: 'critical' }); // over cap 1, 12/12 units
+  b.release(); b2.release();
+  const o = await acq('ollama');
+  await assert.rejects(acq('imagegen', { prio: 'critical', maxWaitMs: 50 }), (e) => e.exitCode === EX_TEMPFAIL);
+  o.release();
+});
+
 test('high load blocks heavy classes only', async () => {
   const { acq } = setup({ load: 28 }); // 2.0/core
   (await acq('codex')).release();
@@ -169,4 +180,16 @@ test('--max-wait that is not a finite non-negative number falls back to config d
   const r2 = cli(['run', '--class', 'build', '--max-wait', '-5', '--', 'true']);
   l.release();
   assert.equal(r.status, 75, r.stderr); assert.equal(r2.status, 75, r2.stderr);
+});
+
+test('nested call of a different class takes its own lease and is capped', async () => {
+  const { acq, cli, events } = setup();
+  const inner = [process.execPath, bin, 'run', '--class', 'build', '--max-wait', '150', '--', process.execPath, '-e', 'process.exit(0)'];
+  const ok = cli(['run', '--class', 'codex', '--', ...inner]);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.ok(events().some((e) => e.event === 'acquire' && e.class === 'build'));
+  const held = await acq('build');
+  const capped = cli(['run', '--class', 'codex', '--', ...inner]);
+  held.release();
+  assert.equal(capped.status, 75, capped.stderr);
 });

@@ -42,7 +42,7 @@ export function defaultGateConfig(ncpu = hostNcpu()) {
       build: { cap: 1, weight: w(Math.floor(pool / 2)), heavy: true },
       codex: { cap: 3, weight: 1, heavy: false },
       imagegen: { cap: 1, weight: w(4), heavy: true },
-      ollama: { cap: 1, weight: w(4), heavy: true, env: { OLLAMA_NUM_PARALLEL: '1' } },
+      ollama: { cap: 1, weight: w(4), heavy: true },
     },
   };
 }
@@ -150,13 +150,13 @@ function reap(stateDir) {
   return live;
 }
 
-// Pure admission decision. Returns null when admitted, else a reason string.
+// Pure admission decision. Critical skips the class cap and load check and may use the reserve; GPU exclusivity still applies. Returns null when admitted, else a reason string.
 export function decide(cfg, leases, { cls, prio, load1, ncpu }) {
   const c = cfg.classes[cls];
   const critical = prio === 'critical';
   const used = leases.reduce((s, l) => s + (l.weight || 0), 0);
   const inClass = leases.filter((l) => l.class === cls).length;
-  if (inClass >= c.cap) return `class cap ${cls} ${inClass}/${c.cap}`;
+  if (!critical && inClass >= c.cap) return `class cap ${cls} ${inClass}/${c.cap}`;
   for (const grp of cfg.exclusive || []) {
     if (grp.includes(cls) && leases.some((l) => l.class !== cls && grp.includes(l.class))) return `exclusive with ${grp.join('/')}`;
   }
@@ -170,7 +170,8 @@ export function decide(cfg, leases, { cls, prio, load1, ncpu }) {
 export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env = process.env,
   sample = () => ({ load1: hostLoad1(env), ncpu: hostNcpu(env) }) } = {}) {
   const stateDir = stateDirOf(cfg, env);
-  if (env.JOB_ROUTER_LEASE) {
+  // Inherit only a lease of the same class; a different class goes through normal admission.
+  if (env.JOB_ROUTER_LEASE && env.JOB_ROUTER_LEASE.split('.')[0] === cls) {
     logEvent(stateDir, { event: 'inherit', class: cls, leaseId: env.JOB_ROUTER_LEASE, pid: process.pid });
     return { id: env.JOB_ROUTER_LEASE, inherited: true, release() {}, setChildPid() {} };
   }
