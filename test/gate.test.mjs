@@ -578,7 +578,7 @@ test('watchdog: a normal exit never signals the group (backgrounded sleep surviv
 test('ungated paths spawn no watchdog (legacy run, critical bypass)', () => {
   const { dir, cli } = setup({ gate: '{broken' });
   const probe = path.join(dir, 'probe.sh');
-  fs.writeFileSync(probe, '#!/bin/sh\npgrep -f "job-router-watchdog:" >/dev/null && echo dog || echo nodog\n', { mode: 0o755 });
+  fs.writeFileSync(probe, '#!/bin/sh\n# only watchdogs spawned by our wrapper (parent or grandparent), not e.g. an outer gate run\nsleep 0.3\nGP=$(ps -o ppid= -p $PPID | tr -d " ")\nif pgrep -P $PPID -f "job-router-watchdog:" >/dev/null || pgrep -P $GP -f "job-router-watchdog:" >/dev/null; then echo dog; else echo nodog; fi\n', { mode: 0o755 });
   const fake = path.join(dir, 'codex.mjs');
   fs.writeFileSync(fake, `#!/usr/bin/env node\nconst r=require('child_process').spawnSync(${JSON.stringify(probe)},{encoding:'utf8'});console.log(r.stdout.trim());\n`, { mode: 0o755 });
   fs.renameSync(fake, fake.replace(/mjs$/, 'cjs'));
