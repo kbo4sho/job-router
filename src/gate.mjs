@@ -254,32 +254,55 @@ export function readLeases(stateDir) {
   return out;
 }
 
-// Process start time via ps (pid-reuse guard). null if ps fails or prints nothing.
-export function procStart(pid, ps = process.env.JOB_ROUTER_PS || 'ps') {
+// Process start times via ONE ps call (pid-reuse guard). TZ/locale pinned so the string is stable.
+// Returns Map(pid -> lstart) or null if ps fails (callers then fall back to kill-only).
+export function procStarts(pids, ps = process.env.JOB_ROUTER_PS || 'ps') {
+  const list = [...new Set(pids.filter((p) => p > 0))];
+  if (!list.length) return new Map();
   try {
-    const r = spawnSync(ps, ['-o', 'lstart=', '-p', String(pid)], { encoding: 'utf8', timeout: 2000 });
-    const out = r.status === 0 ? r.stdout.trim().replace(/\s+/g, ' ') : '';
-    return out || null;
+    const r = spawnSync(ps, ['-o', 'pid=,lstart=', '-p', list.join(',')],
+      { encoding: 'utf8', timeout: 500, env: { ...process.env, TZ: 'UTC0', LC_ALL: 'C' } });
+    if (r.error || r.signal || typeof r.stdout !== 'string') return null;
+    if (r.status !== 0 && !r.stdout.trim()) return r.status === 1 ? new Map() : null; // 1 = none listed
+    const m = new Map();
+    for (const line of r.stdout.split('\n')) {
+      const t = line.trim().match(/^(\d+)\s+(.*)$/);
+      if (t) m.set(Number(t[1]), t[2].replace(/\s+/g, ' '));
+    }
+    return m;
   } catch { return null; }
 }
-// Alive = kill(pid,0) ok AND (no recorded start, or ps unavailable, or start time matches).
+export const procStart = (pid) => procStarts([pid])?.get(pid) ?? null;
+
+// Alive = kill(pid,0) ok AND (no recorded start, ps unavailable, pid not listed, or start matches).
 // A ps failure never makes a live lease stale.
-export function aliveAt(pid, start) {
+export function aliveAt(pid, start, starts) {
   if (!alive(pid)) return false;
-  if (!start) return true;
-  const now = procStart(pid);
-  return now === null || now === start;
+  if (!start || !starts) return true;
+  const now = starts.get(pid);
+  return now === undefined || now === start;
 }
-const pidsDead = (l) => !aliveAt(l.pid, l.pidStart) && !(l.childPid > 0 && aliveAt(l.childPid, l.childStart));
-export function isStale(l) {
-  return l.corrupt || !(l.pid > 0) || pidsDead(l);
+// One batched ps for every live pid that has a recorded start time.
+export function startsFor(leases) {
+  const pids = [];
+  for (const l of leases) {
+    if (l.pidStart && alive(l.pid)) pids.push(l.pid);
+    if (l.childStart && l.childPid > 0 && alive(l.childPid)) pids.push(l.childPid);
+  }
+  return procStarts(pids);
+}
+const pidsDead = (l, st) => !aliveAt(l.pid, l.pidStart, st) && !(l.childPid > 0 && aliveAt(l.childPid, l.childStart, st));
+export function isStale(l, starts = startsFor([l])) {
+  return l.corrupt || !(l.pid > 0) || pidsDead(l, starts);
   // A live pid is never reaped by the boot-time heuristic (NTP steps); pre-boot leases die via dead pids.
 }
 
 function reap(stateDir, owns = () => true) {
   const live = [];
-  for (const l of readLeases(stateDir)) {
-    if (isStale(l)) { if (!owns()) return LOCK_LOST; try { fs.unlinkSync(l.file); } catch {} logEvent(stateDir, { event: 'reap', leaseId: l.id, class: l.class, pid: l.pid }); }
+  const all = readLeases(stateDir);
+  const starts = startsFor(all.filter((l) => !l.corrupt));
+  for (const l of all) {
+    if (isStale(l, starts)) { if (!owns()) return LOCK_LOST; try { fs.unlinkSync(l.file); } catch {} logEvent(stateDir, { event: 'reap', leaseId: l.id, class: l.class, pid: l.pid }); }
     else live.push(l);
   }
   return live;
@@ -370,7 +393,9 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
 
 export function status(cfg, env = process.env) {
   const stateDir = stateDirOf(cfg, env);
-  const leases = readLeases(stateDir).filter((l) => !isStale(l));
+  const all = readLeases(stateDir);
+  const starts = startsFor(all.filter((l) => !l.corrupt));
+  const leases = all.filter((l) => !isStale(l, starts));
   let waiters = [];
   try {
     waiters = fs.readdirSync(path.join(stateDir, 'waiters')).map((n) => {
