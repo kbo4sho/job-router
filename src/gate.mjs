@@ -24,11 +24,19 @@ export function hostLoad1(env = process.env) {
   return l !== undefined && l !== '' && Number.isFinite(Number(l)) ? Number(l) : os.loadavg()[0];
 }
 
+// Default weights before any clamp to poolUnits - reserveCritical.
+export const poolUnitsFor = (ncpu) => Math.max(1, ncpu - 2); // two cores kept for UI/daemons
+export function nominalWeights(ncpu = hostNcpu()) {
+  const pool = poolUnitsFor(ncpu);
+  return { ocr: 1, pdf: 1, build: Math.max(1, Math.floor(pool / 2)), codex: 1, imagegen: 4, ollama: 4 };
+}
+
 export function defaultGateConfig(ncpu = hostNcpu()) {
-  const pool = Math.max(1, ncpu - 2);
+  const pool = poolUnitsFor(ncpu);
   const reserve = Math.max(1, Math.floor(pool / 4));
   const maxW = Math.max(1, pool - reserve); // heaviest weight a normal-priority job can be admitted with
   const w = (n) => Math.max(1, Math.min(maxW, n));
+  const nom = nominalWeights(ncpu);
   return {
     stateDir: '~/.local/state/job-router/gate',
     poolUnits: pool,
@@ -41,10 +49,10 @@ export function defaultGateConfig(ncpu = hostNcpu()) {
     classes: {
       ocr: { cap: Math.max(1, Math.floor(pool / 3)), weight: 1, heavy: true, env: { OMP_THREAD_LIMIT: '1' } },
       pdf: { cap: Math.max(1, Math.floor(pool / 4)), weight: 1, heavy: true },
-      build: { cap: 1, weight: w(Math.floor(pool / 2)), heavy: true },
+      build: { cap: 1, weight: w(nom.build), heavy: true },
       codex: { cap: 3, weight: 1, heavy: false },
-      imagegen: { cap: 1, weight: w(4), heavy: true },
-      ollama: { cap: 1, weight: w(4), heavy: true },
+      imagegen: { cap: 1, weight: w(nom.imagegen), heavy: true },
+      ollama: { cap: 1, weight: w(nom.ollama), heavy: true },
     },
   };
 }
@@ -66,13 +74,24 @@ export function loadGateConfig(file = defaultGateConfigPath(), env = process.env
   for (const [k, v] of Object.entries(raw.classes || {})) cfg.classes[k] = { ...(base.classes[k] || { cap: 1, weight: 1, heavy: true }), ...v };
   if (env.JOB_ROUTER_STATE_DIR) cfg.stateDir = env.JOB_ROUTER_STATE_DIR;
   const maxW = Math.max(1, cfg.poolUnits - (cfg.reserveCritical || 0));
+  const clamped = [];
+  // Expected default weight for the *effective* pool with the default reserve; only a loader
+  // re-clamp below that is reported (so a poolUnits override alone logs nothing).
+  const effPool = cfg.poolUnits >= 1 ? cfg.poolUnits : 1;
+  const effMax = Math.max(1, effPool - Math.max(1, Math.floor(effPool / 4)));
+  const nominal = Object.fromEntries(Object.entries(nominalWeights(effPool + 2)).map(([k, v]) => [k, Math.max(1, Math.min(effMax, v))]));
   for (const [k, c] of Object.entries(cfg.classes)) {
-    if (!(raw.classes?.[k]?.weight >= 0) && c.weight > maxW) c.weight = maxW; // re-clamp defaults
+    if (!(raw.classes?.[k]?.weight >= 0) && c.weight > maxW) {
+      c.weight = maxW; // re-clamp defaults
+      if (nominal[k] > maxW) clamped.push({ class: k, from: nominal[k], to: maxW });
+    }
     if (c.weight > maxW) throw new GateError(`gate config: class ${k} weight ${c.weight} > poolUnits-reserveCritical (${maxW}); it could never be admitted`);
     if (!(c.cap >= 1) || !(c.weight >= 1)) throw new GateError(`gate config: class ${k} needs cap>=1 and weight>=1`);
   }
   if (!(cfg.poolUnits >= 1)) throw new GateError('gate config: poolUnits must be >= 1');
   if (!(cfg.reserveCritical >= 0 && cfg.reserveCritical < cfg.poolUnits)) throw new GateError(`gate config: reserveCritical must be >= 0 and < poolUnits (${cfg.poolUnits})`);
+  // Not logged here (status must stay read-only); acquire() logs these for gated runs.
+  Object.defineProperty(cfg, 'clamped', { value: clamped.map((c) => ({ ...c, maxWeight: maxW })), enumerable: false });
   return cfg;
 }
 
@@ -254,6 +273,7 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
           if (!commitLease(owns, leaseFile, { id, pid: process.pid, class: cls, weight: c.weight, prio, startedAt: Date.now(), cmd })) return LOCK_LOST;
           const used = leases.reduce((a, l) => a + l.weight, 0) + c.weight;
           logEvent(stateDir, { event: 'acquire', class: cls, prio, leaseId: id, pid: process.pid, waitMs: Date.now() - t0, used, pool: cfg.poolUnits, load1: s.load1, ncpu: s.ncpu });
+          for (const w of (cfg.clamped || []).filter((x) => x.class === cls)) logEvent(stateDir, { event: 'weight_clamped', leaseId: id, ...w });
         }
         return why;
       }, Math.max(10, wait - (Date.now() - t0)));
