@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { LOCK_LOST, flockAcquire, logEvent, acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, isStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
+import { _setPsForTests, procStarts, status, procStart, LOCK_LOST, flockAcquire, logEvent, acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, isStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bin = path.join(here, '..', 'bin', 'job-router.mjs');
@@ -536,4 +536,51 @@ test('weight_clamped: timed-out run logs nothing; poolUnits override with defaul
     (await p.acq('build')).release();
     assert.ok(!p.events().some((e) => e.event === 'weight_clamped'), `poolUnits ${poolUnits}`);
   }
+});
+
+test('pid start time: mismatch on a live pid is stale; no start time or ps failure keeps kill-only', async () => {
+  const me = procStart(process.pid);
+  assert.ok(me && /\d{4}$/.test(me), `ps lstart: ${me}`);
+  const bogus = 'Mon Jan  1 00:00:00 1990';
+  assert.equal(isStale({ pid: process.pid, pidStart: me }), false);
+  assert.equal(isStale({ pid: process.pid, pidStart: bogus }), true);           // reused pid
+  assert.equal(isStale({ pid: process.pid }), false);                            // legacy lease
+  assert.equal(isStale({ pid: spawnSync('true').pid, childPid: process.pid, childStart: bogus }), true);
+  _setPsForTests('/nonexistent/ps');
+  try {
+    assert.equal(procStarts([process.pid]), null);
+    assert.equal(procStart(process.pid), null);
+    assert.equal(isStale({ pid: process.pid, pidStart: bogus }), false);         // ps failure: kill-only
+  } finally { _setPsForTests(null); }
+  const { acq, env } = setup();
+  const l = await acq('codex');
+  assert.equal(readLeases(env.JOB_ROUTER_STATE_DIR)[0].pidStart, me);            // recorded on acquire
+  l.release();
+});
+
+test('lstart is TZ/locale independent: recorded under one TZ, checked under another, stays live', () => {
+  const save = { TZ: process.env.TZ, LC_TIME: process.env.LC_TIME };
+  try {
+    process.env.TZ = 'Asia/Tokyo'; process.env.LC_TIME = 'fr_FR.UTF-8';
+    const rec = procStart(process.pid);
+    process.env.TZ = 'America/Chicago'; process.env.LC_TIME = 'de_DE.UTF-8';
+    assert.equal(isStale({ pid: process.pid, pidStart: rec }), false);
+    assert.equal(procStart(process.pid), rec);
+  } finally { for (const [k, v] of Object.entries(save)) { if (v === undefined) delete process.env[k]; else process.env[k] = v; } }
+});
+
+test('N leases cost one ps call per pass', () => {
+  const { env, dir, cfg } = setup();
+  const counter = path.join(dir, 'pscalls'), fakePs = path.join(dir, 'ps.sh');
+  fs.writeFileSync(fakePs, `#!/bin/sh\necho x >> ${counter}\nexec /bin/ps "$@"\n`, { mode: 0o755 });
+  const kids = [0, 1, 2].map(() => spawn('sleep', ['30'], { stdio: 'ignore' }));
+  const ld = path.join(env.JOB_ROUTER_STATE_DIR, 'leases'); fs.mkdirSync(ld, { recursive: true });
+  kids.forEach((k, i) => fs.writeFileSync(path.join(ld, `codex.${i}.json`), JSON.stringify({
+    id: `codex.${i}`, pid: process.pid, pidStart: procStart(process.pid), childPid: k.pid, childStart: procStart(k.pid), class: 'codex', weight: 1, startedAt: Date.now() })));
+  _setPsForTests(fakePs);
+  try {
+    const st = status(cfg(), env);
+    assert.equal(st.leases.length, 3);
+    assert.equal(fs.readFileSync(counter, 'utf8').trim().split('\n').length, 1);
+  } finally { _setPsForTests(null); kids.forEach((k) => k.kill('SIGKILL')); }
 });
