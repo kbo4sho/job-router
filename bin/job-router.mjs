@@ -24,7 +24,11 @@ for (let i = 0; i < argv.length; i++) {
   else if (a === '--gate-config') opts.gateConfig = argv[++i];
   else if (a === '--class') opts.cls = argv[++i];
   else if (a === '--prio') opts.prio = argv[++i];
-  else if (a === '--max-wait') { const v = Number(argv[++i]); opts.maxWait = Number.isFinite(v) && v >= 0 ? v : undefined; }
+  else if (a === '--max-wait') {
+    const raw = argv[++i], v = Number(raw);
+    if (raw === undefined || raw === '' || !Number.isFinite(v) || v < 0) { console.error(`job-router: FAIL: --max-wait must be a non-negative number of ms (got "${raw}")`); process.exit(2); }
+    opts.maxWait = v;
+  }
   else if (a === '--json') opts.json = true;
   else if (a === '--probe') opts.probe = true;
   else { opts.rest = argv.slice(i); break; }

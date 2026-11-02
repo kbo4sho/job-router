@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { spawnSync, spawn } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
-import { acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, EX_TEMPFAIL } from '../src/gate.mjs';
+import { acquire, loadGateConfig, defaultGateConfig, readLeases, tryStealLock, writeAtomic, lockIsStale, withLock, commitLease, EX_TEMPFAIL } from '../src/gate.mjs';
 
 const here = path.dirname(fileURLToPath(import.meta.url));
 const bin = path.join(here, '..', 'bin', 'job-router.mjs');
@@ -70,8 +70,7 @@ test('stale mkdir lock is stolen via tombstone rename', async () => {
   const { acq, env, events } = setup({ gate: { staleLockMs: 50 } });
   const lock = path.join(env.JOB_ROUTER_STATE_DIR, 'lock.d');
   fs.mkdirSync(lock, { recursive: true });
-  fs.writeFileSync(path.join(lock, 'pid'), String(process.pid)); // live pid, only age makes it stale
-  const old = new Date(Date.now() - 1000); fs.utimesSync(lock, old, old);
+  fs.writeFileSync(path.join(lock, 'owner'), `${spawnSync('true').pid}.dead`); // dead owner pid
   (await acq('codex')).release();
   assert.deepEqual(fs.readdirSync(env.JOB_ROUTER_STATE_DIR).filter((n) => n.includes('.stale.')), []);
   assert.ok(events().some((e) => e.event === 'lock_steal'));
@@ -174,13 +173,12 @@ test('lease with dead wrapper but live child pid is not reaped; child pid record
   assert.equal(r.stdout.trim(), 'true', r.stderr);
 });
 
-test('--max-wait that is not a finite non-negative number falls back to config default', async () => {
-  const { acq, cli } = setup({ gate: { queueTimeoutMs: 150 } });
-  const l = await acq('build');
-  const r = cli(['run', '--class', 'build', '--max-wait', 'abc', '--', 'true']);
-  const r2 = cli(['run', '--class', 'build', '--max-wait', '-5', '--', 'true']);
-  l.release();
-  assert.equal(r.status, 75, r.stderr); assert.equal(r2.status, 75, r2.stderr);
+test('invalid --max-wait exits 2 with a clear message', () => {
+  const { cli } = setup();
+  for (const v of ['abc', '-5']) {
+    const r = cli(['run', '--class', 'codex', '--max-wait', v, '--', 'true']);
+    assert.equal(r.status, 2); assert.match(r.stderr, /--max-wait must be a non-negative number/);
+  }
 });
 
 test('nested call of a different class takes its own lease and is capped', async () => {
@@ -265,4 +263,46 @@ test('run --job: signal kills codex child group, releases lease, child pid recor
   assert.throws(() => process.kill(cpid, 0));
   assert.deepEqual(readLeases(env.JOB_ROUTER_STATE_DIR), []);
   assert.ok(events().some((e) => e.event === 'release' && e.signal === 'SIGTERM'));
+});
+
+test('writeAtomic leaves no temp files; readLeases ignores temp/partial files', () => {
+  const { env } = setup();
+  const dir = path.join(env.JOB_ROUTER_STATE_DIR, 'leases'); fs.mkdirSync(dir, { recursive: true });
+  const f = path.join(dir, 'codex.1.a.json');
+  for (let k = 0; k < 50; k++) writeAtomic(f, JSON.stringify({ id: 'x', pad: 'y'.repeat(k * 100) }));
+  assert.deepEqual(fs.readdirSync(dir), ['codex.1.a.json']);
+  fs.writeFileSync(path.join(dir, 'codex.2.b.json.tmp.9.ab'), '{"partial');
+  fs.writeFileSync(path.join(dir, 'codex.3.c.tmp.9.ab.json'), '{"partial');
+  const ls = readLeases(env.JOB_ROUTER_STATE_DIR);
+  assert.equal(ls.length, 1); assert.ok(!ls[0].corrupt);
+});
+
+test('a live-owner lock is never stale, even when old; missing owner falls back to age', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jrg-ls-'));
+  const lock = path.join(dir, 'lock.d'); fs.mkdirSync(lock);
+  fs.writeFileSync(path.join(lock, 'owner'), `${process.pid}.n`);
+  const old = new Date(Date.now() - 3600e3); fs.utimesSync(lock, old, old);
+  assert.equal(lockIsStale(lock, 50), false);
+  fs.writeFileSync(path.join(lock, 'owner'), `${spawnSync('true').pid}.n`);
+  assert.equal(lockIsStale(lock, 50), true);
+  fs.unlinkSync(path.join(lock, 'owner'));
+  fs.utimesSync(lock, old, old); // unlink bumps dir mtime
+  assert.equal(lockIsStale(lock, 50), true); // old, no owner
+  fs.utimesSync(lock, new Date(), new Date());
+  assert.equal(lockIsStale(lock, 60000), false); // fresh, no owner yet
+});
+
+test('release with a foreign nonce leaves lock.d; ownership-lost commit aborts', async () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'jrg-rel-'));
+  const leaseFile = path.join(dir, 'leases', 'codex.1.x.json');
+  const res = await withLock(dir, 10000, (owns) => {
+    assert.equal(owns(), true);
+    fs.writeFileSync(path.join(dir, 'lock.d', 'owner'), 'foreign.nonce');
+    assert.equal(owns(), false);
+    return commitLease(owns, leaseFile, { id: 'x' });
+  });
+  assert.equal(res, false);
+  assert.ok(!fs.existsSync(leaseFile));
+  assert.equal(fs.readFileSync(path.join(dir, 'lock.d', 'owner'), 'utf8'), 'foreign.nonce');
+  assert.deepEqual(fs.readdirSync(dir).filter((n) => n.includes('.stale.')), []);
 });

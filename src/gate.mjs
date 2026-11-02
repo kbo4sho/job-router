@@ -90,22 +90,27 @@ const alive = (pid) => { try { process.kill(pid, 0); return true; } catch (e) { 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 const bootTimeMs = () => Date.now() - os.uptime() * 1000;
 
-function lockIsStale(dir, staleLockMs) {
-  try {
-    const st = fs.statSync(dir);
-    if (Date.now() - st.mtimeMs > staleLockMs) return true;
-    const pid = Number(fs.readFileSync(path.join(dir, 'pid'), 'utf8'));
-    return pid > 0 && !alive(pid);
-  } catch { try { return Date.now() - fs.statSync(dir).mtimeMs > staleLockMs; } catch { return false; } }
+// Write via temp file in the same dir + rename, so readers never see a partial file.
+export function writeAtomic(file, data) {
+  const tmp = `${file}.tmp.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
+  fs.writeFileSync(tmp, data);
+  fs.renameSync(tmp, file);
 }
 
 const readOwner = (dir) => { try { return fs.readFileSync(path.join(dir, 'owner'), 'utf8'); } catch { return null; } };
 const inoOf = (dir) => { try { return fs.statSync(dir).ino; } catch { return null; } };
 
-// Steal a lock judged stale, identified by (inode, owner nonce) observed at judgement time.
-// Rename to a unique tombstone; delete only if the tombstone is the exact lock we judged.
-// Otherwise (someone's fresh lock) try to put it back; if lock.d already exists, leave the
-// tombstone in place and report failure so the caller backs off. Never deletes a live lock.
+// Stale = owner pid dead. Only when the owner file is missing (creation window) fall back to age.
+// A live but paused holder is never stale.
+export function lockIsStale(dir, staleLockMs) {
+  const owner = readOwner(dir);
+  if (owner) { const pid = parseInt(owner, 10); return pid > 0 ? !alive(pid) : true; }
+  try { return Date.now() - fs.statSync(dir).mtimeMs > staleLockMs; } catch { return false; }
+}
+
+// Remove a lock only if it is exactly the one identified by (inode, owner nonce).
+// Rename to a unique tombstone; delete only on match. Otherwise put it back; if lock.d
+// already exists, leave the tombstone in place. Never deletes someone else's lock.
 export function tryStealLock(lock, observed) {
   const tomb = `${lock}.stale.${process.pid}.${crypto.randomBytes(4).toString('hex')}`;
   try { fs.renameSync(lock, tomb); } catch { return false; }
@@ -116,19 +121,19 @@ export function tryStealLock(lock, observed) {
   try { fs.renameSync(tomb, lock); } catch {}
   return false;
 }
+export const releaseLock = tryStealLock;
 
-// Atomic mkdir mutex with stale-steal (dead holder pid or older than staleLockMs).
-async function withLock(stateDir, staleLockMs, fn) {
+// Atomic mkdir mutex. fn receives owns(): true while lock.d is still ours (inode + nonce).
+export async function withLock(stateDir, staleLockMs, fn) {
   const lock = path.join(stateDir, 'lock.d');
   fs.mkdirSync(stateDir, { recursive: true });
   const deadline = Date.now() + Math.max(staleLockMs * 3, 5000);
+  let me;
   for (;;) {
     try {
       fs.mkdirSync(lock);
-      try {
-        fs.writeFileSync(path.join(lock, 'owner'), `${process.pid}.${crypto.randomBytes(6).toString('hex')}`);
-        fs.writeFileSync(path.join(lock, 'pid'), String(process.pid));
-      } catch {}
+      me = { ino: inoOf(lock), owner: `${process.pid}.${crypto.randomBytes(6).toString('hex')}` };
+      try { writeAtomic(path.join(lock, 'owner'), me.owner); } catch {}
       break;
     } catch (e) {
       if (e.code !== 'EEXIST') throw e;
@@ -140,13 +145,23 @@ async function withLock(stateDir, staleLockMs, fn) {
       await sleep(20 + Math.random() * 30);
     }
   }
-  try { return fn(); } finally { try { fs.rmSync(lock, { recursive: true, force: true }); } catch {} }
+  const owns = () => inoOf(lock) === me.ino && readOwner(lock) === me.owner;
+  try { return fn(owns); } finally { releaseLock(lock, me); }
+}
+
+export const LOCK_LOST = Symbol('lock lost');
+// Commit a lease file only while we still own the lock.
+export function commitLease(owns, file, rec) {
+  if (!owns()) return false;
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  writeAtomic(file, JSON.stringify(rec));
+  return true;
 }
 
 export function readLeases(stateDir) {
   const dir = path.join(stateDir, 'leases');
   let names = [];
-  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json')); } catch { return []; }
+  try { names = fs.readdirSync(dir).filter((n) => n.endsWith('.json') && !n.includes('.tmp.')); } catch { return []; }
   const out = [];
   for (const n of names) {
     try { out.push({ file: path.join(dir, n), ...JSON.parse(fs.readFileSync(path.join(dir, n), 'utf8')) }); }
@@ -159,10 +174,10 @@ export function isStale(l, boot = bootTimeMs()) {
   return l.corrupt || !(l.pid > 0) || (!alive(l.pid) && !(l.childPid > 0 && alive(l.childPid))) || (l.startedAt && l.startedAt < boot - 60000);
 }
 
-function reap(stateDir) {
+function reap(stateDir, owns = () => true) {
   const live = [];
   for (const l of readLeases(stateDir)) {
-    if (isStale(l)) { try { fs.unlinkSync(l.file); } catch {} logEvent(stateDir, { event: 'reap', leaseId: l.id, class: l.class, pid: l.pid }); }
+    if (isStale(l)) { if (!owns()) return LOCK_LOST; try { fs.unlinkSync(l.file); } catch {} logEvent(stateDir, { event: 'reap', leaseId: l.id, class: l.class, pid: l.pid }); }
     else live.push(l);
   }
   return live;
@@ -210,22 +225,23 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
   try {
     for (;;) {
       const s = sample();
-      const reason = await withLock(stateDir, cfg.staleLockMs, () => {
-        const leases = reap(stateDir);
+      const reason = await withLock(stateDir, cfg.staleLockMs, (owns) => {
+        const leases = reap(stateDir, owns);
+        if (leases === LOCK_LOST) return LOCK_LOST;
         const why = decide(cfg, leases, { cls, prio, load1: s.load1, ncpu: s.ncpu });
         if (!why) {
-          fs.mkdirSync(path.dirname(leaseFile), { recursive: true });
-          fs.writeFileSync(leaseFile, JSON.stringify({ id, pid: process.pid, class: cls, weight: c.weight, prio, startedAt: Date.now(), cmd }));
+          if (!commitLease(owns, leaseFile, { id, pid: process.pid, class: cls, weight: c.weight, prio, startedAt: Date.now(), cmd })) return LOCK_LOST;
           const used = leases.reduce((a, l) => a + l.weight, 0) + c.weight;
           logEvent(stateDir, { event: 'acquire', class: cls, prio, leaseId: id, pid: process.pid, waitMs: Date.now() - t0, used, pool: cfg.poolUnits, load1: s.load1, ncpu: s.ncpu });
         }
         return why;
       });
       if (!reason) break;
+      if (reason === LOCK_LOST) { logEvent(stateDir, { event: 'lock_lost', class: cls, leaseId: id }); continue; }
       if (reason !== lastReason) { logEvent(stateDir, { event: 'deny', class: cls, prio, leaseId: id, reason, load1: s.load1 }); lastReason = reason; }
       if (!waiting) {
         waiting = true;
-        try { fs.mkdirSync(path.dirname(waitFile), { recursive: true }); fs.writeFileSync(waitFile, JSON.stringify({ id, pid: process.pid, class: cls, prio, since: t0 })); } catch {}
+        try { fs.mkdirSync(path.dirname(waitFile), { recursive: true }); writeAtomic(waitFile, JSON.stringify({ id, pid: process.pid, class: cls, prio, since: t0 })); } catch {}
       }
       if (Date.now() - t0 >= wait) {
         logEvent(stateDir, { event: 'timeout', class: cls, prio, leaseId: id, waitMs: Date.now() - t0, reason });
@@ -242,7 +258,7 @@ export async function acquire(cfg, { cls, prio = 'normal', maxWaitMs, cmd, env =
   };
   process.once('exit', () => release());
   const setChildPid = (childPid) => {
-    try { const rec = JSON.parse(fs.readFileSync(leaseFile, 'utf8')); rec.childPid = childPid; fs.writeFileSync(leaseFile, JSON.stringify(rec)); } catch {}
+    try { const rec = JSON.parse(fs.readFileSync(leaseFile, 'utf8')); rec.childPid = childPid; writeAtomic(leaseFile, JSON.stringify(rec)); } catch {}
   };
   return { id, inherited: false, release, setChildPid, env: { ...(c.env || {}), JOB_ROUTER_LEASE: id } };
 }
